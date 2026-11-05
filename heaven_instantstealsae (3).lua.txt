@@ -1,0 +1,2895 @@
+-- ================================================================
+-- Heaven Hub Instant Steal
+-- Save data + Admin TP X=500 + Bug fixes
+-- ================================================================
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local TweenService      = game:GetService("TweenService")
+local UserInputService  = game:GetService("UserInputService")
+local HttpService       = game:GetService("HttpService")
+
+local lp = Players.LocalPlayer
+local PlayerGui = lp:WaitForChild("PlayerGui")
+local genv = typeof(getgenv) == "function" and getgenv() or _G
+if type(genv.ZincHubCleanup) == "function" then pcall(genv.ZincHubCleanup) end
+
+local function safeReq(root, ...)
+    local o = root
+    for _, n in ipairs({...}) do
+        o = o and o:FindFirstChild(n)
+        if not o then return nil end
+    end
+    local ok, r = pcall(require, o)
+    return ok and r or nil
+end
+
+local RS = ReplicatedStorage
+local es = safeReq(RS, "Client", "EggState")
+local ad = safeReq(RS, "Data", "Assets")
+local si = safeReq(RS, "Shared", "Util", "AreaEggSlotIdentity")
+local cy = safeReq(RS, "Shared", "Util", "AreaEggCycle")
+local rg = safeReq(RS, "Shared", "Modules", "Ragdoll")
+local AssetViewport = safeReq(RS, "Client", "AssetViewport")
+local Rarity = safeReq(RS, "Data", "Rarity")
+local dr = ad and (ad.Directory or ad) or {}
+
+if not es then warn("[ZH] EggState missing") return end
+
+do
+    local t0 = os.clock()
+    while lp:GetAttribute("ProfileReady") ~= true and os.clock() - t0 < 30 do task.wait(0.3) end
+    t0 = os.clock()
+    while (not lp.Character or not lp.Character:FindFirstChild("HumanoidRootPart")) and os.clock() - t0 < 20 do task.wait(0.3) end
+end
+
+-- ================================================================
+-- SNAPSHOT FINDER (fallback robust)
+-- ================================================================
+local Snapshot = nil
+do
+    local networking = RS:FindFirstChild("Packages") and RS.Packages:FindFirstChild("Networking")
+    if networking then
+        Snapshot = networking:FindFirstChild("RF/EggWorld/AskFieldEggSnapshot", true)
+        if not Snapshot then Snapshot = networking:FindFirstChild("AskFieldEggSnapshot", true) end
+    end
+    if not Snapshot then
+        Snapshot = RS:FindFirstChild("AskFieldEggSnapshot", true)
+    end
+    if not Snapshot then
+        for _, d in ipairs(RS:GetDescendants()) do
+            if d.Name == "AskFieldEggSnapshot" then Snapshot = d; break end
+        end
+    end
+end
+
+-- ================================================================
+-- TREADMILL DOFF
+-- ================================================================
+local Remotes = safeReq(RS, "Shared", "Remotes")
+local AskDoff = Remotes and Remotes.Treadmill and Remotes.Treadmill.AskDoff
+
+local function askDoffWithRetry(waitForDone)
+    if not AskDoff then return true end
+    local MAX_ATTEMPTS, RETRY_DELAY = 3, 0.5
+    local function run()
+        local success = false
+        for attempt = 1, MAX_ATTEMPTS do
+            local ok, result = pcall(function() return AskDoff:InvokeServer() end)
+            if ok and result then success = true; break end
+            if attempt < MAX_ATTEMPTS then task.wait(RETRY_DELAY) end
+        end
+        return success
+    end
+    if waitForDone then return run() else task.spawn(run); return true end
+end
+
+UserInputService.JumpRequest:Connect(function() askDoffWithRetry(false) end)
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.Space then askDoffWithRetry(false) end
+end)
+
+-- ================================================================
+-- CONFIG
+-- ================================================================
+local CONFIG = {
+    REFRESH = 0.01,
+    MAX_CARDS = 30,
+    CARD_H = 54,
+    CARD_GAP = 5,
+    UI_SCALE = 0.8,
+    FM = 1.15,
+    RW = 4,
+    DW = 0.3,
+    CAM_DIST = 30,
+    CAM_HEIGHT = 25,
+    FLY_STEP = 700,
+    AUTO_DELAY_SUCCESS = 1.5,
+    AUTO_DELAY_FAIL = 4,
+    AUTO_RETRY_NO_EGG = 3,
+    HISTORY_MAX = 100,
+    ADMIN_OUT_Z = -415,
+    ADMIN_HOME_X = 500,  -- FIX: 530 -> 500
+    SAVE_FILE = "ZincHub_StealPet_Data.json",
+}
+
+local S = {
+    running=false, selectedUid=nil, selectedEgg=nil,
+    eggs={}, filtered={}, rarityFilter={}, lastRefresh=0, dropdownOpen=false,
+    currentSteal = nil,
+    stealMode = "instant",
+    autoEnabled = false,
+    history = {},
+}
+
+local FLOW_TOKEN = 0
+local activeFlow = false
+local cleanedUp = false
+local savePersistData  -- forward declare
+
+-- ================================================================
+-- PERSISTENCE (SAVE / LOAD)
+-- ================================================================
+local function loadPersistData()
+    pcall(function()
+        if type(isfile) ~= "function" or type(readfile) ~= "function" then return end
+        if not isfile(CONFIG.SAVE_FILE) then return end
+        local content = readfile(CONFIG.SAVE_FILE)
+        if not content or content == "" then return end
+        local data = HttpService:JSONDecode(content)
+        if type(data) ~= "table" then return end
+
+        if type(data.history) == "table" then
+            table.clear(S.history)
+            for _, h in ipairs(data.history) do
+                if type(h) == "table" and h.Name then
+                    local col = Color3.fromRGB(170, 190, 200)
+                    local c = h.RarityColor
+                    if type(c) == "table" and #c >= 3 then
+                        col = Color3.new(c[1], c[2], c[3])
+                    end
+                    table.insert(S.history, {
+                        Name = tostring(h.Name or ""),
+                        Rarity = tostring(h.Rarity or ""),
+                        RarityColor = col,
+                        Generation = tonumber(h.Generation) or 0,
+                        Time = tostring(h.Time or ""),
+                    })
+                end
+            end
+            while #S.history > CONFIG.HISTORY_MAX do table.remove(S.history) end
+        end
+
+        if data.stealMode == "admin" or data.stealMode == "instant" then
+            S.stealMode = data.stealMode
+        end
+
+        if type(data.rarityFilter) == "table" then
+            for k, v in pairs(data.rarityFilter) do
+                if type(k) == "string" and type(v) == "boolean" then
+                    S.rarityFilter[k] = v
+                end
+            end
+        end
+    end)
+end
+
+savePersistData = function()
+    pcall(function()
+        if type(writefile) ~= "function" then return end
+        local hist = {}
+        for i, h in ipairs(S.history) do
+            local c = h.RarityColor or Color3.fromRGB(170, 190, 200)
+            hist[i] = {
+                Name = tostring(h.Name or ""),
+                Rarity = tostring(h.Rarity or ""),
+                RarityColor = { c.R, c.G, c.B },
+                Generation = tonumber(h.Generation) or 0,
+                Time = tostring(h.Time or ""),
+            }
+        end
+        local filter = {}
+        for k, v in pairs(S.rarityFilter) do
+            if v then filter[k] = true end
+        end
+        writefile(CONFIG.SAVE_FILE, HttpService:JSONEncode({
+            version = 1,
+            history = hist,
+            stealMode = S.stealMode or "instant",
+            rarityFilter = filter,
+        }))
+    end)
+end
+
+-- Load saved data right at the start
+loadPersistData()
+
+-- ================================================================
+-- STATE
+-- ================================================================
+local st = {
+    on = false, g = 0, cn = {}, bl = {}, bk = {},
+    so = nil, sc = nil, at = nil, h0 = nil,
+    dc = nil, pv = false, nd = true, fz = false,
+    ta = {}, tc = {}, uc = {}, uh = {}, sl = {},
+    pu = nil, dw = CONFIG.DW, n = 0, rz = CONFIG.RW,
+    fm = CONFIG.FM, gc = 0, ct = nil,
+}
+st.gd = {
+    [Enum.HumanoidStateType.Running] = true,
+    [Enum.HumanoidStateType.RunningNoPhysics] = true,
+    [Enum.HumanoidStateType.Landed] = true,
+}
+genv.__ZincSae = st
+
+-- ================================================================
+-- CORE HELPERS
+-- ================================================================
+local function rt()
+    local c = lp.Character
+    if not c then return nil, nil end
+    return c:FindFirstChild("HumanoidRootPart"), c:FindFirstChildOfClass("Humanoid")
+end
+
+local function sp()
+    local w = workspace:FindFirstChild("World") or workspace:FindFirstChild("__OBJECTS")
+    local a = w and w:FindFirstChild("Areas")
+    local l = a and a:FindFirstChild("SeparationLine")
+    return l and l:IsA("BasePart") and l or nil
+end
+
+local function cz()
+    local w = workspace:FindFirstChild("World") or workspace:FindFirstChild("__OBJECTS")
+    local a = w and w:FindFirstChild("Areas")
+    local b = a and a:FindFirstChild("EggCarryBounds")
+    local g = b and b:FindFirstChild("Gameplay1")
+    if not (g and g:IsA("BasePart")) then return nil end
+    return g.Position.Z - g.Size.Z/2 + 15, g.Position.Z + g.Size.Z/2 - 15
+end
+
+local function dl()
+    if workspace:GetAttribute("Event_AdminAbuse") == true then return math.huge end
+    if not cy then return nil end
+    local t = workspace:GetServerTimeNow()
+    local o1, n = pcall(cy.IsNightPhase, t)
+    local o2, ns = pcall(cy.NightStartTime, t)
+    local o3, nr = pcall(cy.NextResetTime, t)
+    if not (o1 and o2 and o3) or type(ns) ~= "number" or type(nr) ~= "number" then return nil end
+    local period = cy.ResetPeriodSeconds or 0
+    if n or t - (nr - period) < 5 then return 0 end
+    return ns - t
+end
+
+local function cr()
+    local ok, s = pcall(es.ReadCarryState)
+    return ok and type(s) == "table" and s.IsCarrying == true
+end
+
+local function av(u)
+    local ok, r = pcall(es.ReadFieldEgg, u)
+    return ok and type(r) == "table" and (r.State == "Slot" or r.State == "Dropped")
+end
+
+local function kd()
+    if rg then
+        local ok, r = pcall(rg.IsRagdolled, lp.Character)
+        if ok and r == true then return true end
+    end
+    local n = tonumber(lp:GetAttribute("RagdollEndTime"))
+    return n ~= nil and n > workspace:GetServerTimeNow()
+end
+
+local function isCancel() return not activeFlow or cleanedUp or genv.__ZincSae ~= st end
+
+local function ct(hu)
+    pcall(function() require(lp.PlayerScripts.PlayerModule):GetControls().humanoid = hu end)
+end
+
+local function ra(ch)
+    local a = ch and ch:FindFirstChild("Animate")
+    if not (a and a:IsA("LocalScript")) then return end
+    task.spawn(function() a.Enabled = false; task.wait(); a.Enabled = true end)
+end
+
+local function fz(on)
+    if on ~= st.fz then
+        st.fz = on
+        local c = lp.Character
+        local a = c and c:FindFirstChild("Animate")
+        if a and a:IsA("LocalScript") then a.Enabled = not on end
+    end
+    if not on then return end
+    local _, hu = rt()
+    local am = hu and hu:FindFirstChildOfClass("Animator")
+    for _, t in am and am:GetPlayingAnimationTracks() or {} do
+        pcall(function() t:Stop(0) end)
+    end
+end
+
+local function ul()
+    for _, c in st.sl do pcall(function() c:Disconnect() end) end
+    table.clear(st.sl)
+end
+
+-- ================================================================
+-- HIDE / SHOW
+-- ================================================================
+local hiddenChar = {}
+local function hideCharacter()
+    table.clear(hiddenChar)
+    local ch = lp.Character
+    if not ch then return end
+    for _, obj in ch:GetDescendants() do
+        if obj:IsA("BasePart") then
+            hiddenChar[obj] = { "LocalTransparencyModifier", obj.LocalTransparencyModifier }
+            pcall(function() obj.LocalTransparencyModifier = 1 end)
+        elseif obj:IsA("Decal") then
+            hiddenChar[obj] = { "Transparency", obj.Transparency }
+            pcall(function() obj.Transparency = 1 end)
+        end
+    end
+end
+
+local function showCharacter()
+    for obj, data in hiddenChar do
+        if obj and obj.Parent then pcall(function() obj[data[1]] = data[2] end) end
+    end
+    table.clear(hiddenChar)
+end
+
+local trailKeywords = { "Trail", "Path", "Route", "Guide", "Marker", "Waypoint", "Footstep", "Line" }
+local hiddenTrail = {}
+local function isTrailVisual(obj)
+    if not obj or not obj.Parent then return false end
+    if not (obj:IsA("BasePart") or obj:IsA("Decal") or obj:IsA("Trail")
+        or obj:IsA("Beam") or obj:IsA("ParticleEmitter") or obj:IsA("Highlight")) then return false end
+    local n = obj.Name
+    for _, k in trailKeywords do if n:find(k, 1, true) then return true end end
+    return false
+end
+
+local function hideTrailObjects()
+    table.clear(hiddenTrail)
+    for _, obj in workspace:GetDescendants() do
+        if isTrailVisual(obj) then
+            if obj:IsA("BasePart") then
+                if obj.LocalTransparencyModifier ~= 1 then
+                    hiddenTrail[obj] = { "LocalTransparencyModifier", obj.LocalTransparencyModifier }
+                    pcall(function() obj.LocalTransparencyModifier = 1 end)
+                end
+            elseif obj:IsA("Decal") then
+                if obj.Transparency ~= 1 then
+                    hiddenTrail[obj] = { "Transparency", obj.Transparency }
+                    pcall(function() obj.Transparency = 1 end)
+                end
+            else
+                if obj.Enabled then
+                    hiddenTrail[obj] = { "Enabled", obj.Enabled }
+                    pcall(function() obj.Enabled = false end)
+                end
+            end
+        end
+    end
+end
+
+local function showTrailObjects()
+    for obj, data in hiddenTrail do
+        if obj and obj.Parent then pcall(function() obj[data[1]] = data[2] end) end
+    end
+    table.clear(hiddenTrail)
+end
+
+-- ================================================================
+-- VISUAL CLONE
+-- ================================================================
+local visualClone = nil
+local function removeVisualClone()
+    if visualClone then pcall(function() visualClone:Destroy() end); visualClone = nil end
+end
+
+local function createVisualCloneAt(position, lookAtPos)
+    removeVisualClone()
+    local ch = lp.Character
+    if not ch or not position then return end
+
+    local wasArchivable = ch.Archivable
+    if not wasArchivable then ch.Archivable = true end
+    local ok, clone = pcall(function() return ch:Clone() end)
+    ch.Archivable = wasArchivable
+    if not ok or not clone then return end
+
+    visualClone = clone
+    for _, obj in ipairs(clone:GetDescendants()) do
+        if obj:IsA("Script") or obj:IsA("LocalScript") or obj:IsA("ModuleScript") then
+            pcall(function() obj:Destroy() end)
+        end
+    end
+
+    local hr = clone:FindFirstChild("HumanoidRootPart")
+    if hr and hr:IsA("BasePart") then
+        if lookAtPos then
+            local dir = Vector3.new(lookAtPos.X - position.X, 0, lookAtPos.Z - position.Z)
+            if dir.Magnitude > 0.1 then
+                hr.CFrame = CFrame.lookAt(position, position + dir.Unit)
+            else
+                hr.CFrame = CFrame.new(position)
+            end
+        else
+            hr.CFrame = CFrame.new(position)
+        end
+    end
+
+    for _, obj in ipairs(clone:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            pcall(function()
+                obj.Anchored = true
+                obj.CanCollide = false
+                obj.CanQuery = false
+                obj.CanTouch = false
+            end)
+        end
+    end
+
+    local hum = clone:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function()
+            hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+            hum.NameDisplayDistance = 0
+            hum.HealthDisplayDistance = 0
+            hum.WalkSpeed = 0
+            hum.JumpPower = 0
+            hum.AutoRotate = false
+            hum:ChangeState(Enum.HumanoidStateType.Physics)
+        end)
+    end
+
+    clone.Name = "ZHVisualClone"
+    clone.Parent = workspace
+end
+
+-- ================================================================
+-- CAMERA LOCK
+-- ================================================================
+local cameraLockCF = nil
+local cameraLockConn = nil
+
+local function lockCameraAt(target, from)
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local origin = from or cam.CFrame.Position
+    local dir = Vector3.new(target.X - origin.X, 0, target.Z - origin.Z)
+    if dir.Magnitude < 1 then dir = Vector3.new(0, 0, 1) end
+    dir = dir.Unit
+    local offset = -dir * CONFIG.CAM_DIST + Vector3.new(0, CONFIG.CAM_HEIGHT, 0)
+    cameraLockCF = CFrame.lookAt(target + offset, target)
+    cam.CameraType = Enum.CameraType.Scriptable
+    cam.CFrame = cameraLockCF
+    createVisualCloneAt(cameraLockCF.Position, target)
+    if cameraLockConn then return end
+    cameraLockConn = RunService.RenderStepped:Connect(function()
+        if not cameraLockCF then return end
+        local c = workspace.CurrentCamera
+        if c then c.CameraType = Enum.CameraType.Scriptable; c.CFrame = cameraLockCF end
+    end)
+end
+
+local function unlockCamera()
+    cameraLockCF = nil
+    if cameraLockConn then cameraLockConn:Disconnect(); cameraLockConn = nil end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    cam.CameraType = Enum.CameraType.Custom
+    local _, hu = rt()
+    if hu then cam.CameraSubject = hu end
+end
+
+-- ================================================================
+-- HUMAN SWAP
+-- ================================================================
+local function sw()
+    local ch = lp.Character
+    local hu = ch and ch:FindFirstChildOfClass("Humanoid")
+    if st.sc and hu == st.sc and st.sc.Parent == ch then return true end
+    if st.sc then
+        if st.so then pcall(function() if st.so.Parent == nil then st.so.Parent = ch end end) end
+        if st.sc then pcall(function() st.sc:Destroy() end) end
+        st.so, st.sc = nil, nil
+        ul()
+    end
+    if not hu or hu.Health <= 0 or hu.FloorMaterial == Enum.Material.Air or not st.gd[hu:GetState()] then
+        return false
+    end
+    local c = hu:Clone()
+    hu.Parent = nil
+    c.Parent = ch
+    workspace.CurrentCamera.CameraSubject = c
+    ct(c)
+    ra(ch)
+    st.so, st.sc, st.at = hu, c, nil
+    local a, b = hu:FindFirstChildOfClass("Animator"), c:FindFirstChildOfClass("Animator")
+    if a and b then
+        st.sl[#st.sl + 1] = a.AnimationPlayed:Connect(function(k)
+            if not k.Animation or c.Parent == nil then return end
+            local ok, t = pcall(function() return b:LoadAnimation(k.Animation) end)
+            if not ok or not t then return end
+            pcall(function()
+                t.Priority, t.Looped = k.Priority, k.Looped
+                t:Play(0.05, math.max(k.WeightTarget, 0.01), k.Speed)
+            end)
+            local s
+            s = k.Stopped:Connect(function()
+                s:Disconnect()
+                pcall(function() t:Stop(0.1) end)
+            end)
+        end)
+    end
+    st.sl[#st.sl + 1] = c.Died:Connect(function()
+        ul()
+        st.so, st.sc = nil, nil
+        local cc = lp.Character
+        if cc and hu.Parent == nil then
+            hu.Parent = cc
+            workspace.CurrentCamera.CameraSubject = hu
+            ct(hu)
+        end
+        pcall(function() c:Destroy() end)
+        hu.Health = 0
+    end)
+    return true
+end
+
+local function un()
+    ul()
+    local ch = lp.Character
+    local o, c = st.so, st.sc
+    st.so, st.sc, st.at = nil, nil, nil
+    if o and ch then pcall(function() if o.Parent == nil then o.Parent = ch end end) end
+    if c then pcall(function() c:Destroy() end) end
+    if ch then
+        local cur = ch:FindFirstChildOfClass("Humanoid")
+        if cur then
+            workspace.CurrentCamera.CameraSubject = cur
+            ct(cur)
+        end
+        local a = ch:FindFirstChild("Animate")
+        if a and a:IsA("LocalScript") then
+            task.spawn(function() a.Enabled = false; task.wait(); a.Enabled = true end)
+        end
+    end
+    fz(false)
+end
+
+-- ================================================================
+-- MOVE / HOME / FLY / TAKE / DROP
+-- ================================================================
+local function mv(tg, ck, to, cp)
+    local c = lp.Character
+    if not rt() then return false, "Move Failed: No Character" end
+    local t0, dn, wy = os.clock(), nil, nil
+    local kp, kt = rt().Position, os.clock()
+    local cn = RunService.PreSimulation:Connect(function(d)
+        if dn ~= nil then return end
+        local hr, hm = rt()
+        if isCancel() then dn, wy = false, "Stopped" return end
+        if not hr or not hm or hm.Health <= 0 or lp.Character ~= c then
+            dn, wy = false, "Move Failed: Character Lost" return
+        end
+        fz(hm.FloorMaterial == Enum.Material.Air)
+        local r = ck and ck()
+        if r then dn, wy = false, r return end
+        if os.clock() - t0 > to then dn, wy = false, "Move Failed: Timeout" return end
+        local v = tg - hr.Position
+        local m = v.Magnitude
+        if m <= 1 then hr.AssemblyLinearVelocity = Vector3.zero; dn = true; return end
+        if os.clock() - kt >= 1 then
+            if (hr.Position - kp).Magnitude < 2 then dn, wy = false, "Move Failed: Blocked" return end
+            kp, kt = hr.Position, os.clock()
+        end
+        hr.AssemblyLinearVelocity = v.Unit * math.min(hm.WalkSpeed * (cp or 1), m / math.max(d, 1/240))
+            + Vector3.new(0, workspace.Gravity * d * 0.5, 0)
+        hr.AssemblyAngularVelocity = Vector3.zero
+    end)
+    st.cn[#st.cn + 1] = cn
+    while dn == nil do RunService.Heartbeat:Wait() end
+    pcall(function() cn:Disconnect() end)
+    return dn, wy
+end
+
+local function hp(en, y, rq, ck)
+    while true do
+        if isCancel() then return false, "Stopped" end
+        local r = ck and ck()
+        if r then return false, r end
+        local hr = rt()
+        if not hr then return false, "Home Failed: Character Lost" end
+        if rq and not cr() then return false, "Home Failed: Egg Lost" end
+        fz(true)
+        local d = Vector3.new(en.X - hr.Position.X, 0, en.Z - hr.Position.Z)
+        if d.Magnitude <= 264 then
+            hr.CFrame = CFrame.new(en) * hr.CFrame.Rotation
+            hr.AssemblyLinearVelocity = Vector3.zero
+            return true
+        end
+        hr.CFrame = CFrame.new(hr.Position.X + d.Unit.X * 264, y, hr.Position.Z + d.Unit.Z * 264) * hr.CFrame.Rotation
+        hr.AssemblyLinearVelocity = Vector3.zero
+        task.wait(0.1)
+    end
+end
+
+local function go(e)
+    local z0, z1 = cz()
+    if not z0 then return false, "Fly Failed: No Corridor" end
+    local h = rt()
+    if not h then return false, "Fly Failed: No Character" end
+    local hz = math.clamp(h.Position.Z, z0, z1)
+    if hz ~= h.Position.Z then
+        local ok, wy = mv(Vector3.new(h.Position.X, h.Position.Y, hz), nil, 10)
+        if not ok then return false, wy end
+        h = rt()
+        if not h then return false, "Fly Failed: No Character" end
+    end
+    local a = Vector3.new(h.Position.X, 0, h.Position.Z)
+    local b = Vector3.new(e.p.X, 0, math.clamp(e.p.Z, z0, z1))
+    local y = math.max(h.Position.Y, e.p.Y) + 3
+    local dh = (b - a).Magnitude
+    local u = dh > 0.1 and (b - a).Unit or Vector3.zero
+    local nt = 0
+    local function ck()
+        if os.clock() < nt then return nil end
+        nt = os.clock() + 0.25
+        if not av(e.u) then return "Fly Failed: Egg Gone" end
+        local dd = dl()
+        if not dd or dd < 2 then return "Fly Failed: Night Coming" end
+        return nil
+    end
+    local STEP = CONFIG.FLY_STEP or 700
+    local w = {}
+    if dh > STEP then
+        local segs = math.ceil(dh / STEP)
+        for i = 1, segs - 1 do
+            local p = a + u * math.min(STEP * i, dh)
+            w[#w + 1] = Vector3.new(p.X, y, p.Z)
+        end
+    end
+    for _, p in ipairs(w) do
+        local hr, hu = rt()
+        local q = Vector3.new(p.X, y, p.Z)
+        local ok, wy = mv(q, ck, hr and hu and (q - hr.Position).Magnitude / math.max(hu.WalkSpeed * st.fm, 16) + 10 or 30, st.fm)
+        if not ok then return false, wy end
+    end
+    return mv(e.p + Vector3.new(0, 3, 0), ck, 10, st.fm)
+end
+
+local function tk(e)
+    local k = nil
+    if si and type(si.LooksLikeFirstAreaUid) == "function" then
+        local ok, first = pcall(si.LooksLikeFirstAreaUid, e.u)
+        if ok and first and type(si.SlotKey) == "function" then
+            local o2, sk = pcall(si.SlotKey, e.r.AreaId, e.r.NestId)
+            if o2 then k = sk end
+        end
+    end
+    local t0 = os.clock()
+    while kd() and os.clock() - t0 < 5 do task.wait(0.1) end
+    local t1 = os.clock()
+    local ok, a, b = pcall(es.CarryFieldEgg, e.u, k)
+    while ok and not a and (
+        (tostring(b):find("knocked down", 1, true) and os.clock() - t0 < 6) or
+        (tostring(b):find("Get closer", 1, true) and os.clock() - t1 < 1.5)
+    ) do
+        task.wait(0.25)
+        ok, a, b = pcall(es.CarryFieldEgg, e.u, k)
+    end
+    if ok and not a and tostring(b):find("gameplay area", 1, true) then
+        local l = sp()
+        local o2, r = pcall(es.ReadFieldEgg, e.u)
+        local p = o2 and type(r) == "table" and typeof(r.BoundsCFrame) == "CFrame" and r.BoundsCFrame.Position
+        if l and p then
+            local lv = l.CFrame.LookVector
+            if mv(p - lv * (lv:Dot(p - l.Position) - 4) + Vector3.new(0, 3, 0), nil, 5) then
+                ok, a, b = pcall(es.CarryFieldEgg, e.u, k)
+            end
+        end
+    end
+    if not ok then return false, "Take Failed: " .. tostring(a) end
+    if not a then return false, "Take Failed: " .. tostring(b or "Denied") end
+    local t = os.clock()
+    repeat task.wait(0.05) until cr() or os.clock() - t > 1
+    if not cr() then return false, "Take Failed: Not Carrying" end
+    st.pu = e.u
+    return true
+end
+
+local function rp()
+    local t0 = os.clock()
+    task.wait(st.dw)
+    local o1, cs = pcall(es.ReadCarryState)
+    local u = o1 and type(cs) == "table" and cs.Uid
+    if type(u) ~= "string" then return false, "Drop Failed: No Carry Uid" end
+    local o2, a, b = pcall(es.DropFieldEgg, "PlayerRequest")
+    if not o2 or not a then return false, "Drop Failed: " .. tostring(o2 and (b or "Denied") or a) end
+    local t1 = os.clock()
+    repeat task.wait(0.03) until not cr() or os.clock() - t1 > 1
+    if cr() then return false, "Drop Failed: Still Carrying" end
+    local o3, r = pcall(es.ReadFieldEgg, u)
+    local ok, wy = tk({ u = u, r = o3 and type(r) == "table" and r or {} })
+    if not ok then return false, "Repick " .. tostring(wy) end
+    return true
+end
+
+local function ze()
+    local w = workspace:FindFirstChild("World") or workspace:FindFirstChild("__OBJECTS")
+    local a = w and w:FindFirstChild("Areas")
+    local g = a and a:FindFirstChild("GuardAreas")
+    local o = {}
+    if not g then return o end
+    for _, z in g:GetChildren() do
+        local b = z:FindFirstChild("Bounds")
+        if b and b:IsA("BasePart") then o[#o + 1] = b.Position.X - b.Size.X / 2 end
+    end
+    table.sort(o, function(x1, x2) return x1 > x2 end)
+    return o
+end
+
+local function sz(z, lq, lv)
+    local tf = workspace:FindFirstChild("Transient")
+    local hb = {}
+    for _, d in tf and tf:GetDescendants() or {} do
+        if d.Name == "PlayerTrap" then
+            local x = d:FindFirstChild("Hitbox") or d
+            if x:IsA("BasePart") and d:GetAttribute("Owner") ~= lp.Name then
+                local s = lv:Dot(x.Position - lq)
+                if s > -40 and s < 70 then
+                    hb[#hb + 1] = { x.Position.Z, math.max(x.Size.X, x.Size.Z) / 2 + 6 }
+                end
+            end
+        end
+    end
+    if #hb == 0 then return z end
+    local z0, z1 = cz()
+    z0, z1 = z0 or z - 60, z1 or z + 60
+    for k = 0, 60 do
+        for _, c in { z + k * 3, z - k * 3 } do
+            if c >= z0 and c <= z1 then
+                local ok = true
+                for _, t in hb do
+                    if math.abs(c - t[1]) < t[2] then ok = false; break end
+                end
+                if ok then return c end
+            end
+        end
+    end
+    return z
+end
+
+local function hm(rq)
+    local l, h = sp(), rt()
+    if not l then return false, "Home Failed: No Separation Line" end
+    if not h then return false, "Home Failed: No Character" end
+    local lv, lq = l.CFrame.LookVector, l.Position
+    local q = h.Position - lv * (lv:Dot(h.Position - lq) - 48)
+    local en = Vector3.new(q.X, lq.Y + 3, sz(q.Z, lq, lv))
+    local y = lq.Y + 45
+    if rq then
+        local k = 0
+        for _, x in ze() do
+            if x < h.Position.X then
+                k += 1
+                if k % st.rz == 0 and x + 10 > en.X + 150 then
+                    local ok, wy = hp(Vector3.new(x + 10, en.Y, q.Z), y, true)
+                    if not ok then return false, wy end
+                    ok, wy = rp()
+                    if not ok then return false, wy end
+                end
+            end
+        end
+    end
+    local ok, wy = hp(en, y, rq)
+    if not ok then return false, wy end
+    if not rq then
+        task.wait(0.1)
+        return mv(en - lv * 70, nil, 5)
+    end
+    ok, wy = rp()
+    if not ok then return false, wy end
+    local o1, cs = pcall(es.ReadCarryState)
+    local sm = o1 and type(cs) == "table" and tonumber(cs.SpeedMultiplier) or 0.9
+    local n0 = st.n
+    ok, wy = mv(en - lv * 70, function()
+        if not cr() then return "Delivered" end
+        return nil
+    end, 5, sm)
+    if wy ~= "Delivered" and not ok then return false, wy end
+    local t = os.clock()
+    repeat task.wait(0.05) until (not cr() and st.n > n0) or os.clock() - t > 3
+    if st.n <= n0 then return false, "Home Failed: Not Claimed" end
+    return true
+end
+
+-- ================================================================
+-- FORMAT / RARITY
+-- ================================================================
+local function formatNum(n)
+    n = tonumber(n) or 0
+    local function trim(x)
+        return (string.format("%.2f", x):gsub("(%..-)0+$", "%1"):gsub("%.$", ""))
+    end
+    local abs = math.abs(n)
+    for _, p in ipairs({ {1e12,"T"}, {1e9,"B"}, {1e6,"M"}, {1e3,"K"} }) do
+        if abs >= p[1] then return trim(n / p[1]) .. p[2] end
+    end
+    return tostring(math.floor(n + 0.5))
+end
+
+local rarityColorCache = {}
+local function getRarityColor(name)
+    local key = string.lower(tostring(name or "")):gsub("%s+", "")
+    if rarityColorCache[key] then return rarityColorCache[key] end
+    local color = Color3.fromRGB(170, 190, 200)
+    if Rarity and Rarity.Rarities then
+        for k, r in pairs(Rarity.Rarities) do
+            local k1 = string.lower(tostring(k)):gsub("%s+", "")
+            local k2 = string.lower(tostring(type(r) == "table" and r.DisplayName or "")):gsub("%s+", "")
+            if k1 == key or k2 == key then
+                local c = type(r) == "table" and r.Color
+                if typeof(c) == "ColorSequence" then c = c.Keypoints[1].Value end
+                if typeof(c) == "Color3" then color = c end
+                break
+            end
+        end
+    end
+    rarityColorCache[key] = color
+    return color
+end
+
+local function getScaleMultiplier(scale)
+    local s = tonumber(scale) or 1
+    if s <= 5 then return s ^ 1.85 end
+    return (s / 5) ^ 1.2 * 19.637875755794113
+end
+
+local function buildEgg(record)
+    local asset = dr[record.AssetCategory]
+    if not asset then return nil end
+    local baseRate = tonumber(asset.EarningRate) or 0
+    local scale = tonumber(record.AssetScale) or 1
+    local rarityName, color = "", Color3.fromRGB(170, 190, 200)
+    if asset.Rarity then
+        rarityName = asset.Rarity.DisplayName or asset.Rarity.Name or ""
+        color = getRarityColor(rarityName)
+    end
+    return {
+        Uid = record.Uid,
+        Category = record.AssetCategory,
+        Name = asset.DisplayName or record.AssetCategory,
+        Generation = math.round(baseRate * getScaleMultiplier(scale)),
+        RarityName = rarityName,
+        RarityColor = color,
+        Position = (record.BoundsCFrame and record.BoundsCFrame.Position) or record.Position,
+        State = record.State,
+        Raw = record,
+    }
+end
+
+local RARITY_LIST = {"Common","Uncommon","Rare","Epic","Legendary","Mythic","Cosmic","Secret","Eternal","Divine"}
+local RARITY_OPTIONS = {}
+for _, n in ipairs(RARITY_LIST) do
+    RARITY_OPTIONS[#RARITY_OPTIONS+1] = {Key = string.lower(n), Label = n, Color = getRarityColor(n)}
+end
+
+local function filterActive()
+    for _, v in pairs(S.rarityFilter) do if v then return true end end
+    return false
+end
+local function eggPass(egg)
+    if not filterActive() then return true end
+    local key = string.lower(tostring(egg.RarityName or "")):gsub("%s+", "")
+    return S.rarityFilter[key] == true
+end
+
+for _, g in ipairs({ pcall(function() return game:GetService("CoreGui") end) and game:GetService("CoreGui") or nil, PlayerGui }) do
+    if g then
+        for _, c in ipairs(g:GetChildren()) do
+            if c:IsA("ScreenGui") and c.Name == "ZincHub" then
+                pcall(function() c:Destroy() end)
+            end
+        end
+    end
+end
+
+-- ================================================================
+-- UI
+-- ================================================================
+local PANEL_W, PANEL_H = 300, 480
+local SKY       = Color3.fromRGB(255, 196, 0)
+local SKY_SOFT  = Color3.fromRGB(200, 140, 0)
+local SKY_DARK  = Color3.fromRGB(150, 100, 0)
+local SKY_GLOW  = Color3.fromRGB(230, 160, 0)
+local STOP_GRAY = Color3.fromRGB(225, 215, 185)
+local SUCCESS_G = Color3.fromRGB(80, 220, 130)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "ZincHub"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 100
+gui.Parent = PlayerGui
+
+local uiScale = Instance.new("UIScale")
+uiScale.Scale = CONFIG.UI_SCALE
+uiScale.Parent = gui
+
+-- NOTIFY
+local notifyStack = Instance.new("Frame")
+notifyStack.AnchorPoint = Vector2.new(1, 0)
+notifyStack.Position = UDim2.new(1, -20, 0, 20)
+notifyStack.Size = UDim2.fromOffset(280, 0)
+notifyStack.AutomaticSize = Enum.AutomaticSize.Y
+notifyStack.BackgroundTransparency = 1
+notifyStack.ZIndex = 200
+notifyStack.Parent = gui
+local notifyLayout = Instance.new("UIListLayout")
+notifyLayout.Padding = UDim.new(0, 6)
+notifyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+notifyLayout.Parent = notifyStack
+local notifyCount = 0
+local function notify(title, text, dur, isError)
+    dur = dur or 3
+    notifyCount += 1
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 0, 0)
+    f.AutomaticSize = Enum.AutomaticSize.Y
+    f.BackgroundColor3 = isError and Color3.fromRGB(255, 225, 225) or Color3.fromRGB(255, 250, 230)
+    f.BackgroundTransparency = 0.08
+    f.BorderSizePixel = 0
+    f.ZIndex = 200
+    f.LayoutOrder = notifyCount
+    f.Parent = notifyStack
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
+    local pad = Instance.new("UIPadding", f)
+    pad.PaddingLeft = UDim.new(0, 12); pad.PaddingRight = UDim.new(0, 12)
+    pad.PaddingTop = UDim.new(0, 8); pad.PaddingBottom = UDim.new(0, 8)
+    local lay = Instance.new("UIListLayout", f)
+    lay.Padding = UDim.new(0, 2); lay.Parent = f
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, 0, 0, 16); t.BackgroundTransparency = 1
+    t.Text = tostring(title); t.TextColor3 = Color3.fromRGB(40, 32, 10)
+    t.TextSize = 12; t.Font = Enum.Font.GothamBold
+    t.TextXAlignment = Enum.TextXAlignment.Left; t.ZIndex = 201; t.Parent = f
+    if text then
+        local b = Instance.new("TextLabel")
+        b.Size = UDim2.new(1, 0, 0, 0); b.AutomaticSize = Enum.AutomaticSize.Y
+        b.BackgroundTransparency = 1; b.Text = tostring(text)
+        b.TextColor3 = Color3.fromRGB(110, 95, 50); b.TextSize = 10
+        b.Font = Enum.Font.GothamMedium; b.TextXAlignment = Enum.TextXAlignment.Left
+        b.TextWrapped = true; b.ZIndex = 201; b.Parent = f
+    end
+    task.delay(dur, function()
+        if f.Parent then
+            TweenService:Create(f, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
+            for _, c in f:GetDescendants() do
+                if c:IsA("TextLabel") then
+                    TweenService:Create(c, TweenInfo.new(0.3), { TextTransparency = 1 }):Play()
+                end
+            end
+            task.wait(0.35); f:Destroy()
+        end
+    end)
+end
+
+-- ICON
+local iconSize = 42
+local icon = Instance.new("ImageButton")
+icon.Size = UDim2.fromOffset(iconSize, iconSize)
+icon.Position = UDim2.new(0, 14, 0.5, -iconSize/2)
+icon.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+icon.Image = "rbxassetid://104159627923158"
+icon.ScaleType = Enum.ScaleType.Crop
+icon.AutoButtonColor = false
+icon.ZIndex = 20
+icon.Parent = gui
+Instance.new("UICorner", icon).CornerRadius = UDim.new(1, 0)
+
+-- PANEL
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.Size = UDim2.fromOffset(PANEL_W, PANEL_H)
+panel.Position = UDim2.new(0.5, -PANEL_W/2, 0.5, -PANEL_H/2)
+panel.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+panel.BorderSizePixel = 0
+panel.ZIndex = 10
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 14)
+local bgGrad = Instance.new("UIGradient")
+bgGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 248, 225)),
+})
+bgGrad.Rotation = 90
+bgGrad.Parent = panel
+
+-- Header
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 46)
+header.BackgroundTransparency = 1
+header.ZIndex = 11
+header.Parent = panel
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -180, 0, 18)
+title.Position = UDim2.fromOffset(14, 8)
+title.BackgroundTransparency = 1
+title.Text = "HEAVEN HUB"
+title.TextColor3 = Color3.fromRGB(40, 32, 10)
+title.TextSize = 14
+title.Font = Enum.Font.GothamBlack
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.ZIndex = 12
+title.Parent = header
+
+local subtitle = Instance.new("TextLabel")
+subtitle.Size = UDim2.new(1, -180, 0, 12)
+subtitle.Position = UDim2.fromOffset(14, 26)
+subtitle.BackgroundTransparency = 1
+subtitle.Text = "INSTANT STEAL"
+subtitle.TextColor3 = SKY_SOFT
+subtitle.TextSize = 9
+subtitle.Font = Enum.Font.GothamBold
+subtitle.TextXAlignment = Enum.TextXAlignment.Left
+subtitle.ZIndex = 12
+subtitle.Parent = header
+
+local statusDot = Instance.new("Frame")
+statusDot.AnchorPoint = Vector2.new(1, 0.5)
+statusDot.Size = UDim2.fromOffset(8, 8)
+statusDot.Position = UDim2.new(1, -66, 0.5, 0)
+statusDot.BackgroundColor3 = SKY
+statusDot.BorderSizePixel = 0
+statusDot.ZIndex = 12
+statusDot.Parent = header
+Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
+
+local discordBtn = Instance.new("TextButton")
+discordBtn.Size = UDim2.fromOffset(24, 24)
+discordBtn.Position = UDim2.new(1, -54, 0, 11)
+discordBtn.BackgroundColor3 = Color3.fromRGB(88, 101, 242)
+discordBtn.Text = "DC"
+discordBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+discordBtn.TextSize = 11
+discordBtn.Font = Enum.Font.GothamBlack
+discordBtn.AutoButtonColor = false
+discordBtn.ZIndex = 12
+discordBtn.Parent = header
+Instance.new("UICorner", discordBtn).CornerRadius = UDim.new(0, 7)
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(24, 24)
+closeBtn.Position = UDim2.new(1, -28, 0, 11)
+closeBtn.BackgroundColor3 = Color3.fromRGB(255, 243, 205)
+closeBtn.Text = "X"
+closeBtn.TextColor3 = SKY_SOFT
+closeBtn.TextSize = 13
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.AutoButtonColor = false
+closeBtn.ZIndex = 12
+closeBtn.Parent = header
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 7)
+
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(1, -24, 0, 1)
+divider.Position = UDim2.fromOffset(12, 46)
+divider.BackgroundColor3 = SKY
+divider.BackgroundTransparency = 0.55
+divider.BorderSizePixel = 0
+divider.ZIndex = 11
+divider.Parent = panel
+
+-- TAB BAR
+local TAB_Y = 50
+local TAB_H = 26
+local CONTENT_Y = TAB_Y + TAB_H + 4
+
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -24, 0, TAB_H)
+tabBar.Position = UDim2.fromOffset(12, TAB_Y)
+tabBar.BackgroundColor3 = Color3.fromRGB(255, 246, 214)
+tabBar.BorderSizePixel = 0
+tabBar.ZIndex = 11
+tabBar.Parent = panel
+Instance.new("UICorner", tabBar).CornerRadius = UDim.new(0, 8)
+
+local function makeTabBtn(text, idx)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1/3, -3, 1, -4)
+    b.Position = UDim2.new((idx-1)/3, (idx == 1) and 2 or 1, 0, 2)
+    b.BackgroundColor3 = Color3.fromRGB(255, 246, 214)
+    b.BackgroundTransparency = 1
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(120, 100, 40)
+    b.TextSize = 9
+    b.Font = Enum.Font.GothamBlack
+    b.AutoButtonColor = false
+    b.ZIndex = 12
+    b.Parent = tabBar
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    return b
+end
+
+local stealTabBtn = makeTabBtn("STEAL", 1)
+local settingsTabBtn = makeTabBtn("SETTINGS", 2)
+local historyTabBtn = makeTabBtn("HISTORY", 3)
+
+stealTabBtn.BackgroundTransparency = 0
+stealTabBtn.BackgroundColor3 = SKY
+stealTabBtn.TextColor3 = Color3.fromRGB(10, 14, 20)
+
+local currentTab = "steal"
+
+-- DROPDOWN
+local DROP_Y, DROP_H = CONTENT_Y, 28
+local dropHeader = Instance.new("TextButton")
+dropHeader.Size = UDim2.new(1, -24, 0, DROP_H)
+dropHeader.Position = UDim2.fromOffset(12, DROP_Y)
+dropHeader.BackgroundColor3 = Color3.fromRGB(255, 243, 205)
+dropHeader.AutoButtonColor = false
+dropHeader.Text = ""
+dropHeader.ZIndex = 12
+dropHeader.Parent = panel
+Instance.new("UICorner", dropHeader).CornerRadius = UDim.new(0, 8)
+
+local dropDot = Instance.new("Frame")
+dropDot.Size = UDim2.fromOffset(7, 7)
+dropDot.Position = UDim2.fromOffset(10, 10)
+dropDot.BackgroundColor3 = SKY
+dropDot.BorderSizePixel = 0
+dropDot.ZIndex = 13
+dropDot.Parent = dropHeader
+Instance.new("UICorner", dropDot).CornerRadius = UDim.new(1, 0)
+
+local dropLabel = Instance.new("TextLabel")
+dropLabel.Size = UDim2.new(1, -70, 1, 0)
+dropLabel.Position = UDim2.fromOffset(26, 0)
+dropLabel.BackgroundTransparency = 1
+dropLabel.Text = "Rarity Filter: All"
+dropLabel.TextColor3 = Color3.fromRGB(40, 32, 10)
+dropLabel.TextSize = 10
+dropLabel.Font = Enum.Font.GothamBold
+dropLabel.TextXAlignment = Enum.TextXAlignment.Left
+dropLabel.TextTruncate = Enum.TextTruncate.AtEnd
+dropLabel.ZIndex = 13
+dropLabel.Parent = dropHeader
+
+local dropArrow = Instance.new("TextLabel")
+dropArrow.AnchorPoint = Vector2.new(1, 0.5)
+dropArrow.Size = UDim2.fromOffset(20, 20)
+dropArrow.Position = UDim2.new(1, -6, 0.5, 0)
+dropArrow.BackgroundTransparency = 1
+dropArrow.Text = "v"
+dropArrow.TextColor3 = SKY_SOFT
+dropArrow.TextSize = 10
+dropArrow.Font = Enum.Font.GothamBold
+dropArrow.ZIndex = 13
+dropArrow.Parent = dropHeader
+
+local ROW_H = 22
+local COLS = 2
+local ROWS = math.ceil(#RARITY_OPTIONS / COLS)
+local BODY_H = ROWS * (ROW_H + 3) + 10
+
+local dropBody = Instance.new("Frame")
+dropBody.Size = UDim2.new(1, -24, 0, BODY_H)
+dropBody.Position = UDim2.fromOffset(12, DROP_Y + DROP_H + 5)
+dropBody.BackgroundColor3 = Color3.fromRGB(255, 246, 214)
+dropBody.BorderSizePixel = 0
+dropBody.Visible = false
+dropBody.ZIndex = 60
+dropBody.ClipsDescendants = true
+dropBody.Parent = panel
+Instance.new("UICorner", dropBody).CornerRadius = UDim.new(0, 9)
+
+local dropInner = Instance.new("Frame")
+dropInner.Size = UDim2.new(1, 0, 1, 0)
+dropInner.BackgroundTransparency = 1
+dropInner.ZIndex = 60
+dropInner.Parent = dropBody
+
+local rarityButtons = {}
+for i, opt in ipairs(RARITY_OPTIONS) do
+    local col = (i - 1) % COLS
+    local row = math.floor((i - 1) / COLS)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.5, -8, 0, ROW_H)
+    btn.Position = UDim2.new(col * 0.5, col == 0 and 0 or 5, 0, 5 + row * (ROW_H + 3))
+    btn.BackgroundColor3 = Color3.fromRGB(255, 244, 208)
+    btn.AutoButtonColor = false
+    btn.Text = ""
+    btn.ZIndex = 61
+    btn.Parent = dropInner
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    local box = Instance.new("Frame")
+    box.Size = UDim2.fromOffset(12, 12)
+    box.Position = UDim2.fromOffset(6, 5)
+    box.BackgroundColor3 = opt.Color
+    box.BackgroundTransparency = 0.6
+    box.BorderSizePixel = 0
+    box.ZIndex = 62
+    box.Parent = btn
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 3)
+    local check = Instance.new("TextLabel")
+    check.Size = UDim2.fromScale(1, 1)
+    check.BackgroundTransparency = 1
+    check.Text = "x"
+    check.TextColor3 = Color3.fromRGB(10, 14, 20)
+    check.TextSize = 10
+    check.Font = Enum.Font.GothamBlack
+    check.Visible = false
+    check.ZIndex = 63
+    check.Parent = box
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -24, 1, 0)
+    lbl.Position = UDim2.fromOffset(22, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = opt.Label
+    lbl.TextColor3 = opt.Color
+    lbl.TextSize = 9
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.ZIndex = 62
+    lbl.Parent = btn
+    rarityButtons[opt.Key] = { Row = btn, Box = box, Check = check }
+end
+
+-- STEAL CARD
+local STEAL_H = 64
+local stealCard = Instance.new("Frame")
+stealCard.Size = UDim2.new(1, -24, 0, STEAL_H)
+stealCard.Position = UDim2.fromOffset(12, DROP_Y + DROP_H + 6)
+stealCard.BackgroundColor3 = Color3.fromRGB(255, 236, 170)
+stealCard.BorderSizePixel = 0
+stealCard.Visible = false
+stealCard.ZIndex = 15
+stealCard.Parent = panel
+Instance.new("UICorner", stealCard).CornerRadius = UDim.new(0, 10)
+
+local stealPreview = Instance.new("Frame")
+stealPreview.Size = UDim2.fromOffset(44, 44)
+stealPreview.Position = UDim2.fromOffset(9, 10)
+stealPreview.BackgroundColor3 = Color3.fromRGB(255, 252, 240)
+stealPreview.BackgroundTransparency = 0.2
+stealPreview.BorderSizePixel = 0
+stealPreview.ClipsDescendants = true
+stealPreview.ZIndex = 16
+stealPreview.Parent = stealCard
+Instance.new("UICorner", stealPreview).CornerRadius = UDim.new(0, 8)
+
+local stealName = Instance.new("TextLabel")
+stealName.Size = UDim2.new(1, -110, 0, 14)
+stealName.Position = UDim2.fromOffset(60, 6)
+stealName.BackgroundTransparency = 1
+stealName.Text = ""
+stealName.TextColor3 = Color3.fromRGB(40, 32, 10)
+stealName.TextSize = 11
+stealName.Font = Enum.Font.GothamBold
+stealName.TextXAlignment = Enum.TextXAlignment.Left
+stealName.TextTruncate = Enum.TextTruncate.AtEnd
+stealName.ZIndex = 16
+stealName.Parent = stealCard
+
+local stealRarity = Instance.new("TextLabel")
+stealRarity.Size = UDim2.new(1, -110, 0, 12)
+stealRarity.Position = UDim2.fromOffset(60, 21)
+stealRarity.BackgroundTransparency = 1
+stealRarity.Text = ""
+stealRarity.TextSize = 9
+stealRarity.Font = Enum.Font.GothamBold
+stealRarity.TextXAlignment = Enum.TextXAlignment.Left
+stealRarity.TextTruncate = Enum.TextTruncate.AtEnd
+stealRarity.ZIndex = 16
+stealRarity.Parent = stealCard
+
+local stealMoney = Instance.new("TextLabel")
+stealMoney.Size = UDim2.new(1, -110, 0, 12)
+stealMoney.Position = UDim2.fromOffset(60, 34)
+stealMoney.BackgroundTransparency = 1
+stealMoney.Text = ""
+stealMoney.TextColor3 = Color3.fromRGB(30, 150, 70)
+stealMoney.TextSize = 10
+stealMoney.Font = Enum.Font.GothamBlack
+stealMoney.TextXAlignment = Enum.TextXAlignment.Left
+stealMoney.ZIndex = 16
+stealMoney.Parent = stealCard
+
+local stealPhase = Instance.new("TextLabel")
+stealPhase.AnchorPoint = Vector2.new(1, 0)
+stealPhase.Size = UDim2.fromOffset(160, 14)
+stealPhase.Position = UDim2.new(1, -10, 0, 8)
+stealPhase.BackgroundTransparency = 1
+stealPhase.Text = "Idle"
+stealPhase.TextColor3 = SKY_SOFT
+stealPhase.TextSize = 10
+stealPhase.Font = Enum.Font.GothamBold
+stealPhase.TextXAlignment = Enum.TextXAlignment.Right
+stealPhase.ZIndex = 16
+stealPhase.Parent = stealCard
+
+local stealPercent = Instance.new("TextLabel")
+stealPercent.AnchorPoint = Vector2.new(1, 0)
+stealPercent.Size = UDim2.fromOffset(160, 18)
+stealPercent.Position = UDim2.new(1, -10, 0, 24)
+stealPercent.BackgroundTransparency = 1
+stealPercent.Text = "0%"
+stealPercent.TextColor3 = SKY_GLOW
+stealPercent.TextSize = 15
+stealPercent.Font = Enum.Font.GothamBlack
+stealPercent.TextXAlignment = Enum.TextXAlignment.Right
+stealPercent.ZIndex = 16
+stealPercent.Parent = stealCard
+
+local stealBarBG = Instance.new("Frame")
+stealBarBG.AnchorPoint = Vector2.new(0.5, 1)
+stealBarBG.Size = UDim2.new(1, -20, 0, 4)
+stealBarBG.Position = UDim2.new(0.5, 0, 1, -6)
+stealBarBG.BackgroundColor3 = Color3.fromRGB(240, 225, 180)
+stealBarBG.BorderSizePixel = 0
+stealBarBG.ZIndex = 16
+stealBarBG.Parent = stealCard
+Instance.new("UICorner", stealBarBG).CornerRadius = UDim.new(1, 0)
+
+local stealBar = Instance.new("Frame")
+stealBar.Size = UDim2.new(0, 0, 1, 0)
+stealBar.BackgroundColor3 = SKY
+stealBar.BorderSizePixel = 0
+stealBar.ZIndex = 17
+stealBar.Parent = stealBarBG
+Instance.new("UICorner", stealBar).CornerRadius = UDim.new(1, 0)
+
+-- CARDS AREA
+local CARDS_TOP = DROP_Y + DROP_H + 6
+local BOTTOM_H = 54
+
+local cardsArea = Instance.new("ScrollingFrame")
+cardsArea.Name = "Cards"
+cardsArea.Size = UDim2.new(1, -24, 1, -CARDS_TOP - BOTTOM_H - 8)
+cardsArea.Position = UDim2.fromOffset(12, CARDS_TOP)
+cardsArea.BackgroundTransparency = 1
+cardsArea.BorderSizePixel = 0
+cardsArea.ScrollBarThickness = 3
+cardsArea.ScrollBarImageColor3 = SKY_SOFT
+cardsArea.CanvasSize = UDim2.new(0, 0, 0, 0)
+cardsArea.AutomaticCanvasSize = Enum.AutomaticSize.Y
+cardsArea.ZIndex = 12
+cardsArea.Parent = panel
+
+local cardsLayout = Instance.new("UIListLayout")
+cardsLayout.Padding = UDim.new(0, CONFIG.CARD_GAP)
+cardsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+cardsLayout.Parent = cardsArea
+
+local emptyLabel = Instance.new("TextLabel")
+emptyLabel.Size = UDim2.new(1, 0, 0, 50)
+emptyLabel.Position = UDim2.new(0, 0, 0.5, -25)
+emptyLabel.BackgroundTransparency = 1
+emptyLabel.Text = "Scanning..."
+emptyLabel.TextColor3 = Color3.fromRGB(140, 120, 60)
+emptyLabel.TextSize = 11
+emptyLabel.Font = Enum.Font.GothamMedium
+emptyLabel.ZIndex = 13
+emptyLabel.Parent = cardsArea
+
+local function updatePanelLayout()
+    if S.currentSteal then
+        local top = DROP_Y + DROP_H + 6 + STEAL_H + 6
+        cardsArea.Position = UDim2.fromOffset(12, top)
+        cardsArea.Size = UDim2.new(1, -24, 1, -top - BOTTOM_H - 8)
+    else
+        cardsArea.Position = UDim2.fromOffset(12, CARDS_TOP)
+        cardsArea.Size = UDim2.new(1, -24, 1, -CARDS_TOP - BOTTOM_H - 8)
+    end
+end
+
+local lastStealCat = nil
+local function updateStealCard()
+    if not S.currentSteal or currentTab ~= "steal" then
+        if stealCard.Visible then
+            stealCard.Visible = false
+            updatePanelLayout()
+        end
+        return
+    end
+    if not stealCard.Visible then
+        stealCard.Visible = true
+        updatePanelLayout()
+    end
+    local e = S.currentSteal.egg
+    if e then
+        stealName.Text = tostring(e.Name or "?")
+        stealRarity.Text = tostring(e.RarityName or "")
+        stealRarity.TextColor3 = e.RarityColor or Color3.fromRGB(170, 190, 200)
+        stealMoney.Text = formatNum(e.Generation or 0) .. "/s"
+        if lastStealCat ~= e.Category then
+            lastStealCat = e.Category
+            for _, c in ipairs(stealPreview:GetChildren()) do
+                if not c:IsA("UICorner") then c:Destroy() end
+            end
+            task.spawn(function()
+                task.wait(0.05)
+                local AV = safeReq(RS, "Client", "AssetViewport")
+                if not AV or not e.Category then return end
+                local ok, vp = pcall(function() return AV.Mount(stealPreview) end)
+                if not ok or not vp then return end
+                vp.Size = UDim2.fromScale(1, 1)
+                vp.Position = UDim2.fromScale(0.5, 0.5)
+                vp.AnchorPoint = Vector2.new(0.5, 0.5)
+                vp.BackgroundTransparency = 1
+                vp.ZIndex = 16
+                pcall(function() AV.ShowAsset(e.Category, vp, true) end)
+            end)
+        end
+    end
+    stealPhase.Text = tostring(S.currentSteal.phase or "Working")
+    local pct = math.floor(S.currentSteal.percent or 0)
+    stealPercent.Text = pct .. "%"
+    TweenService:Create(stealBar, TweenInfo.new(0.15), { Size = UDim2.new(pct/100, 0, 1, 0) }):Play()
+end
+
+-- BUTTON BAR
+local btnBar = Instance.new("Frame")
+btnBar.Size = UDim2.new(1, -24, 0, BOTTOM_H - 10)
+btnBar.Position = UDim2.new(0, 12, 1, -BOTTOM_H + 4)
+btnBar.BackgroundTransparency = 1
+btnBar.ZIndex = 12
+btnBar.Parent = panel
+
+local goBtn = Instance.new("TextButton")
+goBtn.Size = UDim2.new(0.5, -4, 1, 0)
+goBtn.Position = UDim2.new(0, 0, 0, 0)
+goBtn.BackgroundColor3 = SKY
+goBtn.Text = "GO"
+goBtn.TextColor3 = Color3.fromRGB(60, 45, 0)
+goBtn.TextSize = 14
+goBtn.Font = Enum.Font.GothamBlack
+goBtn.AutoButtonColor = false
+goBtn.ZIndex = 13
+goBtn.Parent = btnBar
+Instance.new("UICorner", goBtn).CornerRadius = UDim.new(0, 10)
+
+local stopBtn = Instance.new("TextButton")
+stopBtn.Size = UDim2.new(0.5, -4, 1, 0)
+stopBtn.Position = UDim2.new(0.5, 4, 0, 0)
+stopBtn.BackgroundColor3 = STOP_GRAY
+stopBtn.Text = "STOP"
+stopBtn.TextColor3 = Color3.fromRGB(60, 45, 0)
+stopBtn.TextSize = 14
+stopBtn.Font = Enum.Font.GothamBlack
+stopBtn.AutoButtonColor = false
+stopBtn.ZIndex = 13
+stopBtn.Parent = btnBar
+Instance.new("UICorner", stopBtn).CornerRadius = UDim.new(0, 10)
+
+-- SETTINGS CONTAINER
+local settingsContainer = Instance.new("Frame")
+settingsContainer.Size = UDim2.new(1, -24, 1, -CONTENT_Y - 10)
+settingsContainer.Position = UDim2.fromOffset(12, CONTENT_Y)
+settingsContainer.BackgroundTransparency = 1
+settingsContainer.Visible = false
+settingsContainer.ZIndex = 12
+settingsContainer.Parent = panel
+
+local settingsTitle = Instance.new("TextLabel")
+settingsTitle.Size = UDim2.new(1, 0, 0, 16)
+settingsTitle.Position = UDim2.fromOffset(0, 4)
+settingsTitle.BackgroundTransparency = 1
+settingsTitle.Text = "STEAL MODE"
+settingsTitle.TextColor3 = SKY_SOFT
+settingsTitle.TextSize = 11
+settingsTitle.Font = Enum.Font.GothamBlack
+settingsTitle.TextXAlignment = Enum.TextXAlignment.Left
+settingsTitle.ZIndex = 13
+settingsTitle.Parent = settingsContainer
+
+local settingsHint = Instance.new("TextLabel")
+settingsHint.Size = UDim2.new(1, 0, 0, 12)
+settingsHint.Position = UDim2.fromOffset(0, 22)
+settingsHint.BackgroundTransparency = 1
+settingsHint.Text = "Choose steal mode"
+settingsHint.TextColor3 = Color3.fromRGB(130, 115, 70)
+settingsHint.TextSize = 9
+settingsHint.Font = Enum.Font.GothamMedium
+settingsHint.TextXAlignment = Enum.TextXAlignment.Left
+settingsHint.ZIndex = 13
+settingsHint.Parent = settingsContainer
+
+local function buildModeButton(y, titleText, subtitleText)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 58)
+    frame.Position = UDim2.fromOffset(0, y)
+    frame.BackgroundColor3 = Color3.fromRGB(255, 243, 205)
+    frame.BorderSizePixel = 0
+    frame.ZIndex = 13
+    frame.Parent = settingsContainer
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromScale(1, 1)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    btn.ZIndex = 15
+    btn.Parent = frame
+
+    local indicator = Instance.new("Frame")
+    indicator.Size = UDim2.fromOffset(14, 14)
+    indicator.Position = UDim2.fromOffset(12, 14)
+    indicator.BackgroundColor3 = Color3.fromRGB(255, 246, 214)
+    indicator.BorderSizePixel = 0
+    indicator.ZIndex = 14
+    indicator.Parent = frame
+    Instance.new("UICorner", indicator).CornerRadius = UDim.new(1, 0)
+
+    local indicatorInner = Instance.new("Frame")
+    indicatorInner.AnchorPoint = Vector2.new(0.5, 0.5)
+    indicatorInner.Size = UDim2.fromScale(0.5, 0.5)
+    indicatorInner.Position = UDim2.fromScale(0.5, 0.5)
+    indicatorInner.BackgroundColor3 = SKY
+    indicatorInner.BorderSizePixel = 0
+    indicatorInner.Visible = false
+    indicatorInner.ZIndex = 15
+    indicatorInner.Parent = indicator
+    Instance.new("UICorner", indicatorInner).CornerRadius = UDim.new(1, 0)
+
+    local titleL = Instance.new("TextLabel")
+    titleL.Size = UDim2.new(1, -40, 0, 14)
+    titleL.Position = UDim2.fromOffset(34, 10)
+    titleL.BackgroundTransparency = 1
+    titleL.Text = titleText
+    titleL.TextColor3 = Color3.fromRGB(40, 32, 10)
+    titleL.TextSize = 11
+    titleL.Font = Enum.Font.GothamBold
+    titleL.TextXAlignment = Enum.TextXAlignment.Left
+    titleL.ZIndex = 14
+    titleL.Parent = frame
+
+    local subL = Instance.new("TextLabel")
+    subL.Size = UDim2.new(1, -40, 0, 24)
+    subL.Position = UDim2.fromOffset(34, 26)
+    subL.BackgroundTransparency = 1
+    subL.Text = subtitleText
+    subL.TextColor3 = Color3.fromRGB(120, 105, 60)
+    subL.TextSize = 9
+    subL.Font = Enum.Font.GothamMedium
+    subL.TextXAlignment = Enum.TextXAlignment.Left
+    subL.TextWrapped = true
+    subL.ZIndex = 14
+    subL.Parent = frame
+
+    return { Frame = frame, Button = btn, TitleLabel = titleL, SubLabel = subL, Indicator = indicator, IndicatorInner = indicatorInner }
+end
+
+local instantBtn = buildModeButton(44, "Instant Steal (NORMAL)",
+    "Mode: fly to the pet, steal it, then teleport back instantly")
+
+local adminBtn = buildModeButton(112, "Admin Abuse TP",
+    "Mode: teleport to the egg, steal it, then teleport back")
+
+local statusHeader = Instance.new("TextLabel")
+statusHeader.Size = UDim2.new(1, 0, 0, 16)
+statusHeader.Position = UDim2.fromOffset(0, 178)
+statusHeader.BackgroundTransparency = 1
+statusHeader.Text = "STATUS"
+statusHeader.TextColor3 = SKY_SOFT
+statusHeader.TextSize = 11
+statusHeader.Font = Enum.Font.GothamBlack
+statusHeader.TextXAlignment = Enum.TextXAlignment.Left
+statusHeader.ZIndex = 13
+statusHeader.Parent = settingsContainer
+
+local statusValue = Instance.new("TextLabel")
+statusValue.Size = UDim2.new(1, 0, 0, 44)
+statusValue.Position = UDim2.fromOffset(0, 196)
+statusValue.BackgroundColor3 = Color3.fromRGB(255, 243, 205)
+statusValue.BorderSizePixel = 0
+statusValue.Text = "Mode: Instant Steal (NORMAL)\nState: Idle"
+statusValue.TextColor3 = Color3.fromRGB(70, 55, 15)
+statusValue.TextSize = 10
+statusValue.Font = Enum.Font.GothamMedium
+statusValue.TextXAlignment = Enum.TextXAlignment.Left
+statusValue.TextYAlignment = Enum.TextYAlignment.Top
+statusValue.TextWrapped = true
+statusValue.ZIndex = 13
+statusValue.Parent = settingsContainer
+Instance.new("UICorner", statusValue).CornerRadius = UDim.new(0, 8)
+local statusPad = Instance.new("UIPadding", statusValue)
+statusPad.PaddingLeft = UDim.new(0, 10); statusPad.PaddingRight = UDim.new(0, 10)
+statusPad.PaddingTop = UDim.new(0, 8); statusPad.PaddingBottom = UDim.new(0, 8)
+
+-- AUTO TOGGLE
+local autoHeader = Instance.new("TextLabel")
+autoHeader.Size = UDim2.new(1, 0, 0, 16)
+autoHeader.Position = UDim2.fromOffset(0, 250)
+autoHeader.BackgroundTransparency = 1
+autoHeader.Text = "AUTO STEAL"
+autoHeader.TextColor3 = SKY_SOFT
+autoHeader.TextSize = 11
+autoHeader.Font = Enum.Font.GothamBlack
+autoHeader.TextXAlignment = Enum.TextXAlignment.Left
+autoHeader.ZIndex = 13
+autoHeader.Parent = settingsContainer
+
+local autoFrame = Instance.new("Frame")
+autoFrame.Size = UDim2.new(1, 0, 0, 56)
+autoFrame.Position = UDim2.fromOffset(0, 268)
+autoFrame.BackgroundColor3 = Color3.fromRGB(255, 243, 205)
+autoFrame.BorderSizePixel = 0
+autoFrame.ZIndex = 13
+autoFrame.Parent = settingsContainer
+Instance.new("UICorner", autoFrame).CornerRadius = UDim.new(0, 10)
+
+local autoBtn = Instance.new("TextButton")
+autoBtn.Size = UDim2.fromScale(1, 1)
+autoBtn.BackgroundTransparency = 1
+autoBtn.Text = ""
+autoBtn.ZIndex = 16
+autoBtn.Parent = autoFrame
+
+local autoTitle = Instance.new("TextLabel")
+autoTitle.Size = UDim2.new(1, -60, 0, 14)
+autoTitle.Position = UDim2.fromOffset(12, 10)
+autoTitle.BackgroundTransparency = 1
+autoTitle.Text = "Auto Steal Pet"
+autoTitle.TextColor3 = Color3.fromRGB(40, 32, 10)
+autoTitle.TextSize = 11
+autoTitle.Font = Enum.Font.GothamBold
+autoTitle.TextXAlignment = Enum.TextXAlignment.Left
+autoTitle.ZIndex = 14
+autoTitle.Parent = autoFrame
+
+local autoSub = Instance.new("TextLabel")
+autoSub.Size = UDim2.new(1, -60, 0, 26)
+autoSub.Position = UDim2.fromOffset(12, 26)
+autoSub.BackgroundTransparency = 1
+autoSub.Text = "Steals automatically"
+autoSub.TextColor3 = Color3.fromRGB(120, 105, 60)
+autoSub.TextSize = 9
+autoSub.Font = Enum.Font.GothamMedium
+autoSub.TextXAlignment = Enum.TextXAlignment.Left
+autoSub.TextWrapped = true
+autoSub.ZIndex = 14
+autoSub.Parent = autoFrame
+
+local autoSwitch = Instance.new("Frame")
+autoSwitch.AnchorPoint = Vector2.new(1, 0.5)
+autoSwitch.Size = UDim2.fromOffset(32, 16)
+autoSwitch.Position = UDim2.new(1, -12, 0.5, 0)
+autoSwitch.BackgroundColor3 = Color3.fromRGB(225, 215, 185)
+autoSwitch.BorderSizePixel = 0
+autoSwitch.ZIndex = 14
+autoSwitch.Parent = autoFrame
+Instance.new("UICorner", autoSwitch).CornerRadius = UDim.new(1, 0)
+
+local autoKnob = Instance.new("Frame")
+autoKnob.Size = UDim2.fromOffset(12, 12)
+autoKnob.Position = UDim2.fromOffset(2, 2)
+autoKnob.BackgroundColor3 = Color3.fromRGB(110, 95, 50)
+autoKnob.BorderSizePixel = 0
+autoKnob.ZIndex = 15
+autoKnob.Parent = autoSwitch
+Instance.new("UICorner", autoKnob).CornerRadius = UDim.new(1, 0)
+
+local autoStatusLabel = Instance.new("TextLabel")
+autoStatusLabel.Size = UDim2.new(1, -24, 0, 14)
+autoStatusLabel.Position = UDim2.fromOffset(12, 330)
+autoStatusLabel.BackgroundTransparency = 1
+autoStatusLabel.Text = ""
+autoStatusLabel.TextColor3 = Color3.fromRGB(30, 140, 70)
+autoStatusLabel.TextSize = 9
+autoStatusLabel.Font = Enum.Font.GothamMedium
+autoStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+autoStatusLabel.ZIndex = 13
+autoStatusLabel.Parent = settingsContainer
+
+local function updateAutoUI()
+    if S.autoEnabled then
+        autoSwitch.BackgroundColor3 = SKY
+        TweenService:Create(autoKnob, TweenInfo.new(0.15), {
+            Position = UDim2.fromOffset(18, 2),
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+        }):Play()
+        autoStatusLabel.Text = "On - auto stealing continuously"
+        autoStatusLabel.TextColor3 = Color3.fromRGB(30, 140, 70)
+    else
+        autoSwitch.BackgroundColor3 = Color3.fromRGB(225, 215, 185)
+        TweenService:Create(autoKnob, TweenInfo.new(0.15), {
+            Position = UDim2.fromOffset(2, 2),
+            BackgroundColor3 = Color3.fromRGB(110, 95, 50),
+        }):Play()
+        autoStatusLabel.Text = "Off"
+        autoStatusLabel.TextColor3 = Color3.fromRGB(130, 115, 70)
+    end
+end
+
+local function updateModeUI()
+    local isAdmin = (S.stealMode == "admin")
+    instantBtn.IndicatorInner.Visible = not isAdmin
+    adminBtn.IndicatorInner.Visible = isAdmin
+    instantBtn.Frame.BackgroundColor3 = (not isAdmin) and Color3.fromRGB(255, 230, 150) or Color3.fromRGB(255, 243, 205)
+    adminBtn.Frame.BackgroundColor3 = isAdmin and Color3.fromRGB(255, 230, 150) or Color3.fromRGB(255, 243, 205)
+    instantBtn.TitleLabel.TextColor3 = (not isAdmin) and Color3.fromRGB(40, 32, 10) or Color3.fromRGB(80, 65, 20)
+    adminBtn.TitleLabel.TextColor3 = isAdmin and Color3.fromRGB(40, 32, 10) or Color3.fromRGB(80, 65, 20)
+    if not S.running then
+        statusDot.BackgroundColor3 = isAdmin and Color3.fromRGB(160, 110, 40) or Color3.fromRGB(200, 190, 160)
+    end
+end
+
+local function updateSettingsStatus()
+    if not statusValue or not statusValue.Parent then return end
+    local modeName = (S.stealMode == "admin") and "Admin Abuse TP" or "Instant Steal (NORMAL)"
+    local state = "Idle"
+    if S.currentSteal then state = S.currentSteal.phase or "Working" end
+    local autoLine = S.autoEnabled and "\nAuto: ON" or ""
+    statusValue.Text = "Mode: " .. modeName .. "\nState: " .. state .. autoLine
+end
+
+-- HISTORY CONTAINER
+local historyContainer = Instance.new("Frame")
+historyContainer.Size = UDim2.new(1, -24, 1, -CONTENT_Y - 10)
+historyContainer.Position = UDim2.fromOffset(12, CONTENT_Y)
+historyContainer.BackgroundTransparency = 1
+historyContainer.Visible = false
+historyContainer.ZIndex = 12
+historyContainer.Parent = panel
+
+local historyTitle = Instance.new("TextLabel")
+historyTitle.Size = UDim2.new(1, -70, 0, 16)
+historyTitle.Position = UDim2.fromOffset(0, 4)
+historyTitle.BackgroundTransparency = 1
+historyTitle.Text = "STEAL HISTORY"
+historyTitle.TextColor3 = SKY_SOFT
+historyTitle.TextSize = 11
+historyTitle.Font = Enum.Font.GothamBlack
+historyTitle.TextXAlignment = Enum.TextXAlignment.Left
+historyTitle.ZIndex = 13
+historyTitle.Parent = historyContainer
+
+local clearHistoryBtn = Instance.new("TextButton")
+clearHistoryBtn.AnchorPoint = Vector2.new(1, 0)
+clearHistoryBtn.Size = UDim2.fromOffset(52, 18)
+clearHistoryBtn.Position = UDim2.new(1, 0, 0, 3)
+clearHistoryBtn.BackgroundColor3 = Color3.fromRGB(255, 225, 225)
+clearHistoryBtn.Text = "Clear"
+clearHistoryBtn.TextColor3 = Color3.fromRGB(170, 40, 40)
+clearHistoryBtn.TextSize = 9
+clearHistoryBtn.Font = Enum.Font.GothamBold
+clearHistoryBtn.AutoButtonColor = false
+clearHistoryBtn.ZIndex = 14
+clearHistoryBtn.Parent = historyContainer
+Instance.new("UICorner", clearHistoryBtn).CornerRadius = UDim.new(0, 5)
+
+local historyList = Instance.new("ScrollingFrame")
+historyList.Size = UDim2.new(1, 0, 1, -26)
+historyList.Position = UDim2.fromOffset(0, 26)
+historyList.BackgroundTransparency = 1
+historyList.BorderSizePixel = 0
+historyList.ScrollBarThickness = 3
+historyList.ScrollBarImageColor3 = SKY_SOFT
+historyList.CanvasSize = UDim2.new(0, 0, 0, 0)
+historyList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+historyList.ZIndex = 13
+historyList.Parent = historyContainer
+
+local historyLayout = Instance.new("UIListLayout")
+historyLayout.Padding = UDim.new(0, 4)
+historyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+historyLayout.Parent = historyList
+
+local emptyHistoryLabel = Instance.new("TextLabel")
+emptyHistoryLabel.Size = UDim2.new(1, 0, 0, 60)
+emptyHistoryLabel.Position = UDim2.new(0, 0, 0.4, 0)
+emptyHistoryLabel.BackgroundTransparency = 1
+emptyHistoryLabel.Text = "No steal history yet\nSuccessful steals will appear here"
+emptyHistoryLabel.TextColor3 = Color3.fromRGB(140, 120, 60)
+emptyHistoryLabel.TextSize = 10
+emptyHistoryLabel.Font = Enum.Font.GothamMedium
+emptyHistoryLabel.TextWrapped = true
+emptyHistoryLabel.ZIndex = 14
+emptyHistoryLabel.Parent = historyContainer
+
+-- HISTORY RENDERING
+local historyPool = {}
+
+local function createHistoryItem()
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 0, 46)
+    f.BackgroundColor3 = Color3.fromRGB(255, 243, 205)
+    f.BorderSizePixel = 0
+    f.ZIndex = 13
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
+
+    local accent = Instance.new("Frame")
+    accent.Size = UDim2.new(0, 3, 1, -10)
+    accent.Position = UDim2.fromOffset(0, 5)
+    accent.BackgroundColor3 = SKY
+    accent.BorderSizePixel = 0
+    accent.ZIndex = 14
+    accent.Parent = f
+    Instance.new("UICorner", accent).CornerRadius = UDim.new(1, 0)
+
+    local nameL = Instance.new("TextLabel")
+    nameL.Size = UDim2.new(1, -110, 0, 14)
+    nameL.Position = UDim2.fromOffset(10, 5)
+    nameL.BackgroundTransparency = 1
+    nameL.TextColor3 = Color3.fromRGB(40, 32, 10)
+    nameL.TextSize = 10
+    nameL.Font = Enum.Font.GothamBold
+    nameL.TextXAlignment = Enum.TextXAlignment.Left
+    nameL.TextTruncate = Enum.TextTruncate.AtEnd
+    nameL.ZIndex = 14
+    nameL.Parent = f
+
+    local rarityL = Instance.new("TextLabel")
+    rarityL.Size = UDim2.new(1, -110, 0, 12)
+    rarityL.Position = UDim2.fromOffset(10, 21)
+    rarityL.BackgroundTransparency = 1
+    rarityL.TextSize = 9
+    rarityL.Font = Enum.Font.GothamBold
+    rarityL.TextXAlignment = Enum.TextXAlignment.Left
+    rarityL.TextTruncate = Enum.TextTruncate.AtEnd
+    rarityL.ZIndex = 14
+    rarityL.Parent = f
+
+    local genL = Instance.new("TextLabel")
+    genL.AnchorPoint = Vector2.new(1, 0)
+    genL.Size = UDim2.fromOffset(90, 14)
+    genL.Position = UDim2.new(1, -8, 0, 5)
+    genL.BackgroundTransparency = 1
+    genL.TextColor3 = Color3.fromRGB(30, 150, 70)
+    genL.TextSize = 10
+    genL.Font = Enum.Font.GothamBlack
+    genL.TextXAlignment = Enum.TextXAlignment.Right
+    genL.ZIndex = 14
+    genL.Parent = f
+
+    local timeL = Instance.new("TextLabel")
+    timeL.AnchorPoint = Vector2.new(1, 0)
+    timeL.Size = UDim2.fromOffset(140, 12)
+    timeL.Position = UDim2.new(1, -8, 0, 22)
+    timeL.BackgroundTransparency = 1
+    timeL.TextColor3 = Color3.fromRGB(130, 115, 70)
+    timeL.TextSize = 9
+    timeL.Font = Enum.Font.GothamMedium
+    timeL.TextXAlignment = Enum.TextXAlignment.Right
+    timeL.ZIndex = 14
+    timeL.Parent = f
+
+    return { Frame = f, Name = nameL, Rarity = rarityL, Gen = genL, Time = timeL, Accent = accent }
+end
+
+local function renderHistory()
+    local n = #S.history
+    historyTitle.Text = "STEAL HISTORY (" .. n .. ")"
+    for i = 1, n do
+        local item = historyPool[i]
+        if not item then
+            item = createHistoryItem()
+            item.Frame.Parent = historyList
+            item.Frame.LayoutOrder = i
+            historyPool[i] = item
+        end
+        local e = S.history[i]
+        item.Frame.Visible = true
+        item.Name.Text = tostring(e.Name or "?")
+        item.Rarity.Text = tostring(e.Rarity or "")
+        item.Rarity.TextColor3 = e.RarityColor or Color3.fromRGB(170, 190, 200)
+        item.Accent.BackgroundColor3 = e.RarityColor or SKY
+        item.Gen.Text = formatNum(e.Generation or 0) .. "/s"
+        item.Time.Text = tostring(e.Time or "")
+    end
+    for i = n + 1, #historyPool do
+        historyPool[i].Frame.Visible = false
+    end
+    emptyHistoryLabel.Visible = (n == 0)
+end
+
+local function getTimeString()
+    local ok, result = pcall(function()
+        return os.date("%H:%M:%S") .. " - " .. os.date("%d/%m")
+    end)
+    if ok and result then return result end
+    return tostring(os.time())
+end
+
+local function addHistory(egg)
+    if not egg then return end
+    local timeStr = getTimeString()
+    table.insert(S.history, 1, {
+        Name = egg.Name,
+        Rarity = egg.RarityName,
+        RarityColor = egg.RarityColor,
+        Generation = egg.Generation,
+        Time = timeStr,
+    })
+    while #S.history > CONFIG.HISTORY_MAX do table.remove(S.history) end
+    pcall(renderHistory)
+    savePersistData()  -- FIX: auto-save after each history entry
+end
+
+clearHistoryBtn.MouseButton1Click:Connect(function()
+    table.clear(S.history)
+    renderHistory()
+    savePersistData()
+    notify("History", "History cleared", 2)
+end)
+
+-- TAB SWITCH
+local function setTab(tab)
+    if activeFlow then
+        notify("Tab", "Cannot switch tabs while stealing", 2, true)
+        return
+    end
+    if currentTab == tab then return end
+    currentTab = tab
+
+    if tab ~= "steal" and S.dropdownOpen then
+        S.dropdownOpen = false
+        dropArrow.Rotation = 0
+        dropBody.Visible = false
+        dropBody.BackgroundTransparency = 0
+        dropBody.Size = UDim2.new(1, -24, 0, BODY_H)
+        dropBody.Position = UDim2.fromOffset(12, DROP_Y + DROP_H + 5)
+        for _, opt in ipairs(RARITY_OPTIONS) do
+            local b = rarityButtons[opt.Key]
+            b.Row.BackgroundTransparency = 0
+            b.Box.BackgroundTransparency = S.rarityFilter[opt.Key] and 0 or 0.6
+            b.Check.TextTransparency = 0
+        end
+    end
+
+    local stealVisible = tab == "steal"
+    dropHeader.Visible = stealVisible
+    if not stealVisible then dropBody.Visible = false end
+    stealCard.Visible = stealVisible and S.currentSteal ~= nil
+    cardsArea.Visible = stealVisible
+    btnBar.Visible = stealVisible
+    settingsContainer.Visible = (tab == "settings")
+    historyContainer.Visible = (tab == "history")
+
+    local function styleBtn(btn, active)
+        if active then
+            btn.BackgroundTransparency = 0
+            btn.BackgroundColor3 = SKY
+            btn.TextColor3 = Color3.fromRGB(10, 14, 20)
+        else
+            btn.BackgroundTransparency = 1
+            btn.TextColor3 = Color3.fromRGB(120, 100, 40)
+        end
+    end
+    styleBtn(stealTabBtn, tab == "steal")
+    styleBtn(settingsTabBtn, tab == "settings")
+    styleBtn(historyTabBtn, tab == "history")
+
+    if tab == "steal" then
+        updatePanelLayout()
+    elseif tab == "settings" then
+        updateSettingsStatus()
+        updateAutoUI()
+    elseif tab == "history" then
+        renderHistory()
+    end
+end
+
+stealTabBtn.MouseButton1Click:Connect(function() setTab("steal") end)
+settingsTabBtn.MouseButton1Click:Connect(function() setTab("settings") end)
+historyTabBtn.MouseButton1Click:Connect(function() setTab("history") end)
+
+-- PRESS ANIM
+local function pressAnim(btn)
+    local orig = btn.Size
+    local t = TweenService:Create(btn, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        { Size = UDim2.new(orig.X.Scale, orig.X.Offset - 4, orig.Y.Scale, orig.Y.Offset - 3) })
+    t:Play()
+    t.Completed:Connect(function()
+        if btn.Parent then
+            TweenService:Create(btn, TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = orig }):Play()
+        end
+    end)
+end
+
+-- VIEWPORT / CARD POOL
+local function attachViewport(container, category)
+    if not AssetViewport or not category then return end
+    local ok, vp = pcall(function() return AssetViewport.Mount(container) end)
+    if not ok or not vp then return end
+    vp.Size = UDim2.fromScale(1, 1)
+    vp.Position = UDim2.fromScale(0.5, 0.5)
+    vp.AnchorPoint = Vector2.new(0.5, 0.5)
+    vp.BackgroundTransparency = 1
+    vp.ZIndex = 13
+    local ok2 = pcall(function() AssetViewport.ShowAsset(category, vp, true) end)
+    if not ok2 then pcall(function() vp:Destroy() end) end
+end
+
+local cardPool = {}
+
+local function refreshCardVisual(c, egg)
+    if S.selectedUid == egg.Uid then
+        c.Frame.BackgroundColor3 = Color3.fromRGB(255, 236, 170)
+        c.Accent.BackgroundTransparency = 0
+    else
+        c.Frame.BackgroundColor3 = Color3.fromRGB(255, 245, 215)
+        c.Accent.BackgroundTransparency = 0.15
+    end
+end
+
+local function createCard()
+    local card = Instance.new("TextButton")
+    card.Size = UDim2.new(1, 0, 0, CONFIG.CARD_H)
+    card.BackgroundColor3 = Color3.fromRGB(255, 245, 215)
+    card.AutoButtonColor = false
+    card.Text = ""
+    card.ZIndex = 12
+    card.Visible = false
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 10)
+    local accent = Instance.new("Frame")
+    accent.Size = UDim2.new(0, 3, 1, -12)
+    accent.Position = UDim2.new(0, 0, 0, 6)
+    accent.BackgroundColor3 = SKY
+    accent.BackgroundTransparency = 0.15
+    accent.BorderSizePixel = 0
+    accent.ZIndex = 14
+    accent.Parent = card
+    Instance.new("UICorner", accent).CornerRadius = UDim.new(1, 0)
+    local preview = Instance.new("Frame")
+    preview.Name = "Preview"
+    preview.Size = UDim2.fromOffset(40, 40)
+    preview.Position = UDim2.fromOffset(9, 7)
+    preview.BackgroundColor3 = Color3.fromRGB(255, 252, 240)
+    preview.BackgroundTransparency = 0.2
+    preview.BorderSizePixel = 0
+    preview.ClipsDescendants = true
+    preview.ZIndex = 13
+    preview.Parent = card
+    Instance.new("UICorner", preview).CornerRadius = UDim.new(0, 8)
+    local nameL = Instance.new("TextLabel")
+    nameL.Size = UDim2.new(1, -105, 0, 15)
+    nameL.Position = UDim2.fromOffset(56, 6)
+    nameL.BackgroundTransparency = 1
+    nameL.Text = ""
+    nameL.TextColor3 = Color3.fromRGB(40, 32, 10)
+    nameL.TextSize = 11
+    nameL.Font = Enum.Font.GothamBold
+    nameL.TextXAlignment = Enum.TextXAlignment.Left
+    nameL.TextTruncate = Enum.TextTruncate.AtEnd
+    nameL.ZIndex = 13
+    nameL.Parent = card
+    local rarityL = Instance.new("TextLabel")
+    rarityL.Size = UDim2.new(1, -105, 0, 12)
+    rarityL.Position = UDim2.fromOffset(56, 22)
+    rarityL.BackgroundTransparency = 1
+    rarityL.Text = ""
+    rarityL.TextColor3 = Color3.fromRGB(170, 190, 200)
+    rarityL.TextSize = 9
+    rarityL.Font = Enum.Font.GothamBold
+    rarityL.TextXAlignment = Enum.TextXAlignment.Left
+    rarityL.TextTruncate = Enum.TextTruncate.AtEnd
+    rarityL.ZIndex = 13
+    rarityL.Parent = card
+    local earnL = Instance.new("TextLabel")
+    earnL.AnchorPoint = Vector2.new(1, 0)
+    earnL.Size = UDim2.fromOffset(90, 16)
+    earnL.Position = UDim2.new(1, -8, 0, 34)
+    earnL.BackgroundTransparency = 1
+    earnL.Text = ""
+    earnL.TextColor3 = Color3.fromRGB(30, 150, 70)
+    earnL.TextSize = 11
+    earnL.Font = Enum.Font.GothamBlack
+    earnL.TextXAlignment = Enum.TextXAlignment.Right
+    earnL.TextYAlignment = Enum.TextYAlignment.Center
+    earnL.TextTruncate = Enum.TextTruncate.AtEnd
+    earnL.ZIndex = 13
+    earnL.Parent = card
+    local tag = Instance.new("TextLabel")
+    tag.AnchorPoint = Vector2.new(1, 0)
+    tag.Size = UDim2.fromOffset(90, 12)
+    tag.Position = UDim2.new(1, -8, 0, 22)
+    tag.BackgroundTransparency = 1
+    tag.Text = "/s"
+    tag.TextColor3 = Color3.fromRGB(30, 140, 70)
+    tag.TextSize = 8
+    tag.Font = Enum.Font.GothamMedium
+    tag.TextXAlignment = Enum.TextXAlignment.Right
+    tag.ZIndex = 13
+    tag.Parent = card
+    return {
+        Frame = card, Preview = preview, NameLabel = nameL, RarityLabel = rarityL,
+        EarnLabel = earnL, Accent = accent,
+        Egg = nil, LastUid = nil, LastCat = nil
+    }
+end
+
+local function getCard(idx)
+    if not cardPool[idx] then
+        local c = createCard()
+        c.Frame.Parent = cardsArea
+        c.Frame.LayoutOrder = idx
+        cardPool[idx] = c
+        c.Frame.MouseButton1Click:Connect(function()
+            if not c.Egg or activeFlow then return end
+            if S.selectedUid == c.Egg.Uid then
+                S.selectedUid = nil
+                S.selectedEgg = nil
+            else
+                S.selectedUid = c.Egg.Uid
+                S.selectedEgg = c.Egg
+            end
+            for _, card in ipairs(cardPool) do
+                if card.Egg then refreshCardVisual(card, card.Egg) end
+            end
+        end)
+        c.Frame.MouseEnter:Connect(function()
+            if S.selectedUid ~= (c.Egg and c.Egg.Uid) then
+                TweenService:Create(c.Frame, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(255, 236, 170) }):Play()
+            end
+        end)
+        c.Frame.MouseLeave:Connect(function()
+            if S.selectedUid ~= (c.Egg and c.Egg.Uid) then
+                TweenService:Create(c.Frame, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(255, 245, 215) }):Play()
+            end
+        end)
+    end
+    return cardPool[idx]
+end
+
+local function updateCard(c, egg)
+    c.Frame.Visible = true
+    c.Egg = egg
+    if c.LastUid ~= egg.Uid or c.LastCat ~= egg.Category then
+        c.LastUid = egg.Uid
+        c.LastCat = egg.Category
+        for _, child in ipairs(c.Preview:GetChildren()) do
+            if not child:IsA("UICorner") then child:Destroy() end
+        end
+        attachViewport(c.Preview, egg.Category)
+        c.NameLabel.Text = tostring(egg.Name or "UNKNOWN")
+        c.RarityLabel.Text = tostring(egg.RarityName or "")
+        c.RarityLabel.TextColor3 = egg.RarityColor or Color3.fromRGB(170, 190, 200)
+    end
+    c.EarnLabel.Text = formatNum(egg.Generation or 0)
+    refreshCardVisual(c, egg)
+    if S.selectedUid == egg.Uid then S.selectedEgg = egg end
+end
+
+local function renderCards()
+    local total = math.min(#S.filtered, CONFIG.MAX_CARDS)
+    for i = 1, total do updateCard(getCard(i), S.filtered[i]) end
+    for i = total + 1, #cardPool do cardPool[i].Frame.Visible = false end
+    emptyLabel.Visible = total == 0
+    if total == 0 then emptyLabel.Text = Snapshot and "Scanning... no egg found" or "Snapshot remote NOT FOUND" end
+end
+
+local function refreshEggs(force)
+    local now = tick()
+    if not force and now - S.lastRefresh < CONFIG.REFRESH then return end
+    if not Snapshot then return end
+    local ok, result = pcall(function() return Snapshot:InvokeServer() end)
+    if not ok then return end
+    S.lastRefresh = now
+    table.clear(S.eggs)
+    if result and result.Records then
+        for _, record in ipairs(result.Records) do
+            if record.State == "Slot" or record.State == "Dropped" then
+                local data = buildEgg(record)
+                if data then S.eggs[#S.eggs + 1] = data end
+            end
+        end
+    end
+    table.sort(S.eggs, function(a, b) return a.Generation > b.Generation end)
+    table.clear(S.filtered)
+    for _, egg in ipairs(S.eggs) do
+        if eggPass(egg) then S.filtered[#S.filtered + 1] = egg end
+    end
+    if S.selectedUid then
+        local found = false
+        for _, egg in ipairs(S.eggs) do
+            if egg.Uid == S.selectedUid then S.selectedEgg = egg; found = true; break end
+        end
+        if not found then S.selectedUid = nil; S.selectedEgg = nil end
+    end
+end
+
+-- DROPDOWN ANIM
+local DROP_ANIM_INFO = TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+
+local function updateDropLabel()
+    local names = {}
+    for _, opt in ipairs(RARITY_OPTIONS) do
+        if S.rarityFilter[opt.Key] then names[#names + 1] = opt.Label end
+    end
+    if #names == 0 then dropLabel.Text = "Rarity Filter: All"
+    elseif #names <= 2 then dropLabel.Text = "Filter: " .. table.concat(names, ", ")
+    else dropLabel.Text = "Filter: " .. names[1] .. " +" .. (#names - 1) end
+end
+
+local function updateChecks()
+    for _, opt in ipairs(RARITY_OPTIONS) do
+        local b = rarityButtons[opt.Key]
+        local on = S.rarityFilter[opt.Key] == true
+        b.Check.Visible = on
+        b.Box.BackgroundTransparency = on and 0 or 0.6
+        b.Row.BackgroundColor3 = on and Color3.fromRGB(255, 230, 150) or Color3.fromRGB(255, 244, 208)
+    end
+    updateDropLabel()
+end
+
+local function closeDropdown()
+    if not S.dropdownOpen then return end
+    S.dropdownOpen = false
+    TweenService:Create(dropArrow, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { Rotation = 0 }):Play()
+    local t = TweenService:Create(dropBody, DROP_ANIM_INFO, {
+        Position = UDim2.fromOffset(12, DROP_Y + DROP_H + 5 - 8),
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -24, 0, 0),
+    })
+    t:Play()
+    for _, opt in ipairs(RARITY_OPTIONS) do
+        local b = rarityButtons[opt.Key]
+        TweenService:Create(b.Row, TweenInfo.new(0.12), { BackgroundTransparency = 1 }):Play()
+        TweenService:Create(b.Box, TweenInfo.new(0.12), { BackgroundTransparency = 1 }):Play()
+        TweenService:Create(b.Check, TweenInfo.new(0.12), { TextTransparency = 1 }):Play()
+    end
+    t.Completed:Connect(function()
+        if not S.dropdownOpen and dropBody.Parent then
+            dropBody.Visible = false
+            dropBody.BackgroundTransparency = 0
+            dropBody.Size = UDim2.new(1, -24, 0, BODY_H)
+            dropBody.Position = UDim2.fromOffset(12, DROP_Y + DROP_H + 5)
+            for _, opt in ipairs(RARITY_OPTIONS) do
+                local b = rarityButtons[opt.Key]
+                b.Row.BackgroundTransparency = 0
+                b.Box.BackgroundTransparency = S.rarityFilter[opt.Key] and 0 or 0.6
+                b.Check.TextTransparency = 0
+            end
+        end
+    end)
+end
+
+local function openDropdown()
+    if S.dropdownOpen then return end
+    S.dropdownOpen = true
+    dropBody.BackgroundTransparency = 1
+    dropBody.Size = UDim2.new(1, -24, 0, 0)
+    dropBody.Position = UDim2.fromOffset(12, DROP_Y + DROP_H + 5 - 8)
+    for _, opt in ipairs(RARITY_OPTIONS) do
+        local b = rarityButtons[opt.Key]
+        b.Row.BackgroundTransparency = 1
+        b.Box.BackgroundTransparency = 1
+        b.Check.TextTransparency = 1
+    end
+    dropBody.Visible = true
+    TweenService:Create(dropArrow, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Rotation = 180 }):Play()
+    TweenService:Create(dropBody, DROP_ANIM_INFO, {
+        Position = UDim2.fromOffset(12, DROP_Y + DROP_H + 5),
+        BackgroundTransparency = 0,
+        Size = UDim2.new(1, -24, 0, BODY_H),
+    }):Play()
+    task.spawn(function()
+        for _, opt in ipairs(RARITY_OPTIONS) do
+            if not S.dropdownOpen then break end
+            local b = rarityButtons[opt.Key]
+            task.wait(0.015)
+            TweenService:Create(b.Row, TweenInfo.new(0.18), { BackgroundTransparency = 0 }):Play()
+            TweenService:Create(b.Box, TweenInfo.new(0.18), { BackgroundTransparency = S.rarityFilter[opt.Key] and 0 or 0.6 }):Play()
+            TweenService:Create(b.Check, TweenInfo.new(0.18), { TextTransparency = 0 }):Play()
+        end
+    end)
+end
+
+dropHeader.MouseButton1Click:Connect(function()
+    pressAnim(dropHeader)
+    if S.dropdownOpen then closeDropdown() else openDropdown() end
+end)
+
+for _, opt in ipairs(RARITY_OPTIONS) do
+    local b = rarityButtons[opt.Key]
+    b.Row.MouseButton1Click:Connect(function()
+        if activeFlow then return end
+        S.rarityFilter[opt.Key] = not S.rarityFilter[opt.Key]
+        updateChecks()
+        savePersistData()
+        refreshEggs(true)
+        renderCards()
+    end)
+end
+
+-- MISC BUTTONS
+discordBtn.MouseButton1Click:Connect(function()
+    if setclipboard then pcall(setclipboard, "https://discord.gg/2NVtcFvbaB") end
+    notify("Discord", "Discord link copied: .gg/2NVtcFvbaB", 3)
+end)
+discordBtn.MouseEnter:Connect(function()
+    TweenService:Create(discordBtn, TweenInfo.new(0.12), {BackgroundColor3 = Color3.fromRGB(110, 125, 255)}):Play()
+end)
+discordBtn.MouseLeave:Connect(function()
+    TweenService:Create(discordBtn, TweenInfo.new(0.12), {BackgroundColor3 = Color3.fromRGB(88, 101, 242)}):Play()
+end)
+
+local pulseConn = RunService.Heartbeat:Connect(function()
+    if not S.running then return end
+    local t = tick() * 2
+    local a = 0.4 + 0.4 * (0.5 + 0.5 * math.sin(t))
+    local base = S.stealMode == "admin" and Color3.fromRGB(255, 170, 60) or SKY
+    statusDot.BackgroundColor3 = base:Lerp(Color3.fromRGB(255, 255, 255), a * 0.5)
+end)
+
+local function setRunning(on)
+    S.running = on
+    if on then
+        statusDot.BackgroundColor3 = S.stealMode == "admin" and Color3.fromRGB(255, 170, 60) or SKY
+    else
+        statusDot.BackgroundColor3 = S.stealMode == "admin" and Color3.fromRGB(160, 110, 40) or Color3.fromRGB(200, 190, 160)
+    end
+end
+
+local function setStatus(msg)
+    if emptyLabel and emptyLabel.Parent then
+        emptyLabel.Text = msg
+        emptyLabel.Visible = true
+    end
+end
+
+local function restoreStatus()
+    if not emptyLabel or not emptyLabel.Parent then return end
+    if #S.filtered == 0 then
+        emptyLabel.Text = Snapshot and "Scanning... no egg found" or "Snapshot remote NOT FOUND"
+        emptyLabel.Visible = true
+    else
+        emptyLabel.Visible = false
+    end
+end
+
+-- PROGRESS MONITOR
+local progressConn
+local function startProgressMonitor()
+    if progressConn then return end
+    progressConn = RunService.Heartbeat:Connect(function()
+        local cs = S.currentSteal
+        if not cs then return end
+        local hr = rt()
+        if not hr then return end
+        local ph = cs.phase
+        local pct = cs.percent or 0
+        if ph == "Flying" and cs.flyStart and cs.flyTarget then
+            local total = (cs.flyTarget - cs.flyStart).Magnitude
+            if total > 1 then
+                local remaining = (hr.Position - cs.flyTarget).Magnitude
+                pct = math.clamp((1 - remaining / total) * 50, 0, 50)
+            end
+        elseif ph == "Taking" then
+            pct = math.max(pct, 58)
+        elseif ph == "Home" and cs.homeStart and cs.homeTarget then
+            local total = (cs.homeTarget - cs.homeStart).Magnitude
+            if total > 1 then
+                local remaining = (hr.Position - cs.homeTarget).Magnitude
+                pct = math.clamp(58 + (1 - remaining / total) * 40, 58, 98)
+            else
+                pct = 98
+            end
+        end
+        cs.percent = pct
+    end)
+end
+
+local function stopProgressMonitor()
+    if progressConn then progressConn:Disconnect(); progressConn = nil end
+end
+
+task.spawn(function()
+    while gui.Parent and not cleanedUp do
+        if S.currentSteal then updateStealCard() end
+        if currentTab == "settings" then updateSettingsStatus() end
+        task.wait(0.1)
+    end
+end)
+
+-- CLEANUP VISUAL
+local function restoreVisuals()
+    unlockCamera()
+    removeVisualClone()
+    un()
+    showCharacter()
+    showTrailObjects()
+end
+
+-- ================================================================
+-- FLOW RUNNERS
+-- ================================================================
+local function runInstantFlow(token, egg, e)
+    S.currentSteal.phase = "Flying"
+    local hr0 = rt()
+    if hr0 then S.currentSteal.flyStart = hr0.Position end
+    updateStealCard()
+
+    local goOk, goErr = go(e)
+    if not goOk then return false, "Fly: " .. tostring(goErr) end
+    if isCancel() then return false, "Stopped" end
+
+    S.currentSteal.phase = "Taking"
+    S.currentSteal.percent = math.max(S.currentSteal.percent or 0, 55)
+    updateStealCard()
+
+    local tkOk, tkErr = tk(e)
+    if not tkOk then return false, "Take: " .. tostring(tkErr) end
+    if isCancel() then return false, "Stopped" end
+
+    notify("Carrying", "Carrying " .. tostring(egg.Name) .. " home")
+    S.currentSteal.phase = "Home"
+    updateStealCard()
+
+    local hr1 = rt()
+    if hr1 then
+        S.currentSteal.homeStart = hr1.Position
+        local l = sp()
+        if l then
+            local lv, lq = l.CFrame.LookVector, l.Position
+            local q = hr1.Position - lv * (lv:Dot(hr1.Position - lq) - 48)
+            S.currentSteal.homeTarget = Vector3.new(q.X, lq.Y + 3, q.Z)
+        end
+    end
+
+    local hmOk, hmErr = hm(true)
+    if not hmOk then return false, "Home: " .. tostring(hmErr) end
+
+    removeVisualClone()
+    S.currentSteal.phase = "Done"
+    S.currentSteal.percent = 100
+    updateStealCard()
+    return true
+end
+
+-- ================================================================
+-- ADMIN ABUSE FLOW - FIXED
+-- TP Z=-415 -> TP to card -> Carry -> Check carried -> TP X=500
+-- ================================================================
+local function runAdminAbuseFlow(token, egg, e)
+    -- Phase 1: TP out to Z=-415 (keep X, Y)
+    S.currentSteal.phase = "TP Out (Z=-415)"
+    S.currentSteal.percent = 10
+    updateStealCard()
+
+    local hr = rt()
+    if not hr then return false, "No Character" end
+
+    hr.CFrame = CFrame.new(hr.Position.X, hr.Position.Y, CONFIG.ADMIN_OUT_Z)
+    hr.AssemblyLinearVelocity = Vector3.zero
+    hr.AssemblyAngularVelocity = Vector3.zero
+    task.wait(0.25)
+    if isCancel() then return false, "Stopped" end
+
+    -- Phase 2: TP to pet card
+    S.currentSteal.phase = "TP to Card"
+    S.currentSteal.percent = 30
+    updateStealCard()
+
+    hr = rt()
+    if not hr then return false, "No Character" end
+    hr.CFrame = CFrame.new(e.p.X, e.p.Y + 3, e.p.Z)
+    hr.AssemblyLinearVelocity = Vector3.zero
+    hr.AssemblyAngularVelocity = Vector3.zero
+    task.wait(0.2)
+    if isCancel() then return false, "Stopped" end
+
+    -- Phase 3: Carry
+    S.currentSteal.phase = "Taking"
+    S.currentSteal.percent = 55
+    updateStealCard()
+
+    local tkOk, tkErr = tk(e)
+    if not tkOk then return false, "Take: " .. tostring(tkErr) end
+    if isCancel() then return false, "Stopped" end
+
+    -- Phase 4: CHECK CARRYING
+    if not cr() then return false, "Not Carrying after take" end
+    notify("Carrying", "Picked up " .. tostring(egg.Name) .. " - teleporting to X=500")
+
+    -- Phase 5: TP to X=500 (keep Y, Z)
+    S.currentSteal.phase = "TP Out (X=500)"
+    S.currentSteal.percent = 85
+    updateStealCard()
+
+    hr = rt()
+    if not hr then return false, "No Character" end
+    hr.CFrame = CFrame.new(CONFIG.ADMIN_HOME_X, hr.Position.Y, hr.Position.Z)
+    hr.AssemblyLinearVelocity = Vector3.zero
+    hr.AssemblyAngularVelocity = Vector3.zero
+    task.wait(0.35)
+    if isCancel() then return false, "Stopped" end
+
+    -- Verify still carrying after TP
+    if not cr() then return false, "Egg dropped after TP" end
+
+    removeVisualClone()
+    S.currentSteal.phase = "Done"
+    S.currentSteal.percent = 100
+    updateStealCard()
+    return true
+end
+
+local function runFlow(token)
+    local egg = S.selectedEgg
+    if not egg then return false, "Select a card first!" end
+    local e = { u = egg.Uid, p = egg.Position, r = egg.Raw or {} }
+    if not e.p or typeof(e.p) ~= "Vector3" then return false, "Invalid position." end
+    -- AreaId check skipped, tk() handles nil safely
+
+    local modeName = (S.stealMode == "admin") and "Admin Abuse TP" or "Instant Steal"
+    S.currentSteal = {
+        egg = egg, uid = egg.Uid, phase = "Starting", percent = 0,
+        flyStart = nil, flyTarget = e.p, homeStart = nil, homeTarget = nil,
+    }
+    updateStealCard()
+    notify("Steal [" .. modeName .. "]", "Starting: " .. tostring(egg.Name))
+
+    S.currentSteal.phase = "Leaving Treadmill"
+    updateStealCard()
+    askDoffWithRetry(true)
+    task.wait(0.3)
+    if isCancel() then return false, "Stopped" end
+
+    local okSwap = false
+    for _ = 1, 8 do
+        if isCancel() then return false, "Stopped" end
+        if sw() then okSwap = true; break end
+        task.wait(0.2)
+    end
+    if not okSwap then return false, "Swap failed" end
+    if isCancel() then return false, "Stopped" end
+
+    local hr0 = rt()
+    lockCameraAt(e.p, hr0 and hr0.Position or nil)
+    hideCharacter()
+    hideTrailObjects()
+
+    if S.stealMode == "admin" then
+        return runAdminAbuseFlow(token, egg, e)
+    else
+        return runInstantFlow(token, egg, e)
+    end
+end
+
+-- START / STOP / AUTO
+local autoTick
+
+local function startStealFlow()
+    if activeFlow then return false end
+    if not S.selectedUid or not S.selectedEgg then return false end
+
+    FLOW_TOKEN += 1
+    local token = FLOW_TOKEN
+    activeFlow = true
+    st.on = true
+    setRunning(true)
+    startProgressMonitor()
+
+    task.spawn(function()
+        local ok1, res1, res2 = xpcall(function() return runFlow(token) end, debug.traceback)
+        if not ok1 then warn("[ZH] " .. tostring(res1)) end
+
+        local success = ok1 and res1 == true
+        local currentEgg = S.currentSteal and S.currentSteal.egg
+
+        if success and currentEgg then
+            local okH, errH = pcall(addHistory, currentEgg)
+            if not okH then warn("[ZH] addHistory: " .. tostring(errH)) end
+        end
+
+        if token ~= FLOW_TOKEN then return end
+
+        if S.currentSteal then
+            S.currentSteal.percent = 100
+            S.currentSteal.phase = success and "Done" or ("Failed: " .. tostring(ok1 and res2 or "Error"))
+            updateStealCard()
+        end
+
+        setStatus("Restoring humanoid...")
+        restoreVisuals()
+        stopProgressMonitor()
+
+        task.wait(0.6)
+        S.currentSteal = nil
+        updateStealCard()
+        st.on = false
+        setRunning(false)
+        activeFlow = false
+        savePersistData()
+        task.delay(1, restoreStatus)
+        updateSettingsStatus()
+
+        if S.autoEnabled and not cleanedUp then
+            local waitTime = success and CONFIG.AUTO_DELAY_SUCCESS or CONFIG.AUTO_DELAY_FAIL
+            task.delay(waitTime, function()
+                if S.autoEnabled and not cleanedUp and not activeFlow then
+                    autoTick()
+                end
+            end)
+        end
+    end)
+    return true
+end
+
+autoTick = function()
+    if not S.autoEnabled or cleanedUp or activeFlow then return end
+    if not gui.Parent then return end
+
+    task.wait(1)
+    if not S.autoEnabled or cleanedUp or activeFlow then return end
+
+    refreshEggs(true)
+    renderCards()
+
+    local best = nil
+    for _, egg in ipairs(S.filtered) do
+        best = egg
+        break
+    end
+
+    if not best then
+        notify("Auto", "No matching card, waiting...", 2)
+        task.delay(CONFIG.AUTO_RETRY_NO_EGG, function()
+            if S.autoEnabled and not cleanedUp and not activeFlow then
+                autoTick()
+            end
+        end)
+        return
+    end
+
+    S.selectedUid = best.Uid
+    S.selectedEgg = best
+    renderCards()
+
+    if not startStealFlow() then
+        task.delay(CONFIG.AUTO_RETRY_NO_EGG, function()
+            if S.autoEnabled and not cleanedUp and not activeFlow then
+                autoTick()
+            end
+        end)
+    end
+end
+
+-- MODE SWITCH
+instantBtn.Button.MouseButton1Click:Connect(function()
+    if activeFlow then notify("Mode", "Cannot change mode while stealing", 2, true); return end
+    if S.stealMode == "instant" then return end
+    S.stealMode = "instant"
+    updateModeUI()
+    updateSettingsStatus()
+    savePersistData()
+    notify("Mode", "Selected Instant Steal (NORMAL)", 2.5)
+end)
+
+adminBtn.Button.MouseButton1Click:Connect(function()
+    if activeFlow then notify("Mode", "Cannot change mode while stealing", 2, true); return end
+    if S.stealMode == "admin" then return end
+    S.stealMode = "admin"
+    updateModeUI()
+    updateSettingsStatus()
+    savePersistData()
+    notify("Mode", "Selected Admin Abuse TP (Z=-415 -> card -> X=500)", 2.5)
+end)
+
+-- AUTO TOGGLE
+autoBtn.MouseButton1Click:Connect(function()
+    S.autoEnabled = not S.autoEnabled
+    updateAutoUI()
+    updateSettingsStatus()
+    if S.autoEnabled then
+        notify("Auto", "Auto Steal ON", 2.5)
+        if not activeFlow then
+            task.delay(0.3, function()
+                if S.autoEnabled and not activeFlow and not cleanedUp then
+                    autoTick()
+                end
+            end)
+        end
+    else
+        notify("Auto", "Auto Steal OFF", 2.5)
+    end
+end)
+
+-- GO / STOP
+goBtn.MouseButton1Click:Connect(function()
+    pressAnim(goBtn)
+    if activeFlow then return end
+    if not S.selectedUid or not S.selectedEgg then
+        setStatus("Select a card first!")
+        notify("Heaven Hub", "No card selected to steal", 2.5, true)
+        task.delay(2, function()
+            if gui.Parent and not activeFlow then restoreStatus() end
+        end)
+        return
+    end
+    startStealFlow()
+end)
+
+stopBtn.MouseButton1Click:Connect(function()
+    pressAnim(stopBtn)
+    local hadAuto = S.autoEnabled
+    FLOW_TOKEN += 1
+    activeFlow = false
+    st.on = false
+    if hadAuto then
+        S.autoEnabled = false
+        updateAutoUI()
+    end
+    restoreVisuals()
+    stopProgressMonitor()
+    S.currentSteal = nil
+    updateStealCard()
+    setRunning(false)
+    restoreStatus()
+    updateSettingsStatus()
+    savePersistData()
+    notify("Heaven Hub", "Stopped" .. (hadAuto and " (auto off)" or ""), 2)
+end)
+
+-- PANEL TOGGLE + DRAG
+local panelOpen = true
+local function setPanelOpen(open)
+    panelOpen = open
+    if open then
+        panel.Visible = true
+        panel.Size = UDim2.fromOffset(PANEL_W - 16, PANEL_H - 16)
+        -- FIX: Enum.EasingStyle.Back, Enum.EasingDirection.Out
+        TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = UDim2.fromOffset(PANEL_W, PANEL_H) }):Play()
+    else
+        local t = TweenService:Create(panel, TweenInfo.new(0.15, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Size = UDim2.fromOffset(PANEL_W - 16, PANEL_H - 16) })
+        t:Play()
+        t.Completed:Connect(function()
+            if not panelOpen and panel.Parent then panel.Visible = false end
+        end)
+    end
+end
+
+closeBtn.MouseButton1Click:Connect(function() setPanelOpen(false) end)
+icon.MouseEnter:Connect(function()
+    TweenService:Create(icon, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = UDim2.fromOffset(iconSize + 4, iconSize + 4) }):Play()
+end)
+icon.MouseLeave:Connect(function()
+    TweenService:Create(icon, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = UDim2.fromOffset(iconSize, iconSize) }):Play()
+end)
+
+local dragConns = {}
+
+-- Draggable open/close icon (click without moving still toggles the panel)
+do
+    local iconDragging, iconMoved, iconStart, iconStartPos, iconInput = false, false, nil, nil, nil
+    dragConns[#dragConns + 1] = icon.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            iconDragging = true
+            iconMoved = false
+            iconStart = input.Position
+            iconStartPos = icon.Position
+            iconInput = input
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    if iconDragging and not iconMoved then
+                        setPanelOpen(not panelOpen)
+                    end
+                    iconDragging = false
+                end
+            end)
+        end
+    end)
+    dragConns[#dragConns + 1] = UserInputService.InputChanged:Connect(function(input)
+        if not iconDragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= iconInput then return end
+        local delta = input.Position - iconStart
+        if not iconMoved and delta.Magnitude < 6 then return end
+        iconMoved = true
+        local sc = uiScale.Scale
+        icon.Position = UDim2.new(
+            iconStartPos.X.Scale, iconStartPos.X.Offset + delta.X / sc,
+            iconStartPos.Y.Scale, iconStartPos.Y.Offset + delta.Y / sc
+        )
+    end)
+end
+do
+    local dragging, dragStart, startPos, dragInput = false
+    dragConns[#dragConns + 1] = header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = panel.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    dragConns[#dragConns + 1] = header.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    dragConns[#dragConns + 1] = UserInputService.InputChanged:Connect(function(input)
+        if dragging and dragInput and input == dragInput then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- LOOPS + INIT
+task.spawn(function()
+    while gui.Parent and not cleanedUp do
+        task.wait(CONFIG.REFRESH)
+        if panel.Visible and not activeFlow and currentTab == "steal" then
+            refreshEggs()
+            renderCards()
+        end
+    end
+end)
+
+task.spawn(function()
+    task.wait(0.3)
+    if gui.Parent and not cleanedUp then
+        refreshEggs(true)
+        renderCards()
+        if not Snapshot then
+            notify("Warning", "Snapshot remote not found - cannot load eggs", 5, true)
+        end
+    end
+end)
+
+-- AUTO SAVE LOOP (every 5s)
+task.spawn(function()
+    while gui.Parent and not cleanedUp do
+        task.wait(5)
+        savePersistData()
+    end
+end)
+
+updateChecks()
+updateModeUI()
+updateSettingsStatus()
+updateAutoUI()
+renderHistory()
+setRunning(false)
+
+local startMsg = "Loaded."
+if S.stealMode == "admin" then
+    startMsg = "Loaded. Mode: Admin Abuse TP (Z=-415 -> X=500)"
+else
+    startMsg = "Loaded Heaven Hub Instant Steal"
+end
+if #S.history > 0 then
+    startMsg = startMsg .. " | " .. #S.history .. " history loaded"
+end
+notify("Heaven Hub", startMsg, 4)
+
+-- ================================================================
+-- CLEANUP (SAVE DATA)
+-- ================================================================
+genv.ZincHubCleanup = function()
+    if cleanedUp then return end
+    cleanedUp = true
+    FLOW_TOKEN += 1
+    activeFlow = false
+    st.on = false
+    S.autoEnabled = false
+    
+    -- SAVE DATA before cleanup
+    pcall(savePersistData)
+    
+    restoreVisuals()
+    stopProgressMonitor()
+    setRunning(false)
+    S.currentSteal = nil
+    if pulseConn then pulseConn:Disconnect() end
+    for _, c in dragConns do pcall(function() c:Disconnect() end) end
+    for _, c in st.cn do pcall(function() c:Disconnect() end) end
+    table.clear(st.cn)
+    removeVisualClone()
+    if gui then gui:Destroy() end
+    genv.ZincHubCleanup = nil
+end
